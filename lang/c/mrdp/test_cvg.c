@@ -276,48 +276,31 @@ int main(void)
         if (!(up > 12 && up < 48 && rep < n - 4 && chdiff > 0)) fails++;
     }
 
-    /* 10. The shade enters the combiner with 9 bits, 0..511: the interpolator saturates it there (below 0 -> 0, above 511 -> 511;
-     * the hardware's RGBA correction stage) and it is a plain positive number as A, B, C and D (in the CombineColor and
-     * CombineAlpha stages); before, it was clamped to a byte. A flat shade (R, G, B, A) = (300, 600, -50, 450) is
-     * (300, 511, 0, 450) here; PRIM = (100, 100, 100, 128). */
+    /* 10. The shade enters the combiner saturated to a byte: below 0 -> 0, above 255 -> 255 (with 9 bits, 0..511, a lit surface's
+     * shade overshoots 255 at its edges -- Link's tunic with Navi's light -- and the raw 9 bits of the first cycle's TEXEL0 * SHADE
+     * went past 255; as COMBINED, the second cycle's C, they are a negative number: a black pixel). A flat shade (R, G, B, A) =
+     * (300, 600, -50, 450) is (255, 255, 0, 255) here; PRIM = (100, 100, 100, 128). */
 #define SH_TRI(r, g, b, a) tri_shade(10 << 16, (r), (g), (b), (a))
-    /* (SHADE - PRIM) * PRIM_A: R (300 - 100) * 128 + 0x80 >> 8 = 100, G (511 - 100) * 128 -> 206, B (0 - 100) * 128 -> -50: bits 8:7 set, 0
-     * (the byte-clamped shade gave 78, 78, 0) */
+    /* (SHADE - PRIM) * PRIM_A: R (255 - 100) * 128 + 0x80 >> 8 = 78 (the same as 255), G 78, B (0 - 100) * 128 -> -50: bits 8:7 set, 0 */
     setup(AA_OPA);
     cmd(0x3A000000u, 0x64646480u); CC_RGB(4, 3, 10, 7);
     SH_TRI(300, 600, -50, 450);
-    check("shade 9 bits: (SHADE - PRIM) * PRIM_A, 300 -> 100", 12, 3, c5551(100, 206, 0, 1));
+    check("shade: a byte, (SHADE - PRIM) * PRIM_A, 300 -> 255 -> 78", 12, 3, c5551(78, 78, 0, 1));
     /* a shade inside a byte is as it was: (200 - 100) * 128 -> 50 */
     setup(AA_OPA);
     cmd(0x3A000000u, 0x64646480u); CC_RGB(4, 3, 10, 7);
     SH_TRI(200, 100, 0, 0);
-    check("shade 9 bits: in range, unchanged", 12, 3, c5551(50, 0, 0, 1));
-    /* 2-cycle: the first cycle's D = SHADE is COMBINED, its raw 9 bits (300, 511, 0): as A, 300 is positive and 511 is -1 (bits 8:7
-     * set); (COMBINED - PRIM) * PRIM_A: R 100, G (-1 - 100) * 128 + 0x80 >> 8 = -50 -> 0, B 0 (the byte-clamped shade: 78, 78, 0) */
-    /* (the first blender cycle passes the pixel: A = 0, B = 1, M = the pixel) */
+    check("shade: in range, unchanged", 12, 3, c5551(50, 0, 0, 1));
+    /* Link's tunic: 2 cycles, PRIM (255) * SHADE, then ENV (200) * COMBINED. With a shade of 300 the first cycle gave 299, whose
+     * bit 8 made COMBINED a negative C and the pixel black; the shade as a byte (255): 254, then 200 * 254 + 0x80 >> 8 = 198 */
     setup(AA_OPA);
     cmd(0x2F000000u | (1u << 20) | (3u << 6) | (3u << 4), (1u << 3) | (1u << 6) | (1u << 13) | (3u << 26) | (2u << 18));
-    cmd(0x3A000000u, 0x64646480u);
-    cmd(0x3C000000u | (15u << 20) | (31u << 15) | (7u << 12) | (7u << 9) | (0u << 5) | 10u,
-        (15u << 28) | (4u << 15) | (7u << 12) | (3u << 9) | (7u << 21) | (7u << 18) | (3u << 24) | (7u << 6) | (7u << 3) | 3u);
-    SH_TRI(300, 600, -50, 450);
-    check("shade 9 bits: 2-cycle, COMBINED holds 300 / 511 / 0", 12, 3, c5551(100, 0, 0, 1));
-    /* SHADE's alpha as C of the colour combiner: PRIM red 100 * 450 + 0x80 >> 8 = 176 (a signed 9-bit would be -62) */
-    setup(AA_OPA);
-    cmd(0x3A000000u, 0x64646480u); CC_RGB(3, 15, 11, 7);
-    SH_TRI(300, 600, -50, 450);
-    check("shade 9 bits: SHADE alpha as C, 100 * 450 -> 176", 12, 3, c5551(176, 176, 176, 1));
-    /* SHADE's alpha as D of the alpha combiner, with the alpha compare (threshold 8): 450 = 0x1C2 has bits 8:7 set: alpha 0, not
-     * drawn; 300 = 0x12C has bit 8: 256, drawn (the byte-clamped shade drew both) */
-    for (int k = 0; k < 2; k++) {
-        setup((AA_OPA & ~(1u << 13)) | 1u);
-        cmd(0x39000000u, 0x00000008u);
-        cmd(0x3A000000u, 0x64646480u);
-        cmd(0x3C000000u | (15u << 5) | 31u, (15u << 24) | (3u << 6) | (7u << 21) | (7u << 18) | (7u << 3) | 4u);
-        SH_TRI(300, 600, -50, k ? 300 : 450);
-        check(k ? "shade 9 bits: alpha 300 as D, drawn" : "shade 9 bits: alpha 450 as D (bits 8:7 set), the alpha compare drops it",
-              12, 3, k ? c5551(100, 100, 100, 1) : 0x0001);
-    }
+    cmd(0x3A000000u, 0xFFFFFFFFu);
+    cmd(0x3B000000u, 0xC8C8C8FFu);
+    cmd(0x3C000000u | (3u << 20) | (4u << 15) | (7u << 12) | (7u << 9) | (5u << 5) | 0u,
+        (15u << 28) | (7u << 15) | (7u << 12) | (7u << 9) | (7u << 21) | (7u << 18) | (15u << 24) | (7u << 6) | (7u << 3) | 7u);
+    SH_TRI(300, 300, 300, 255);
+    check("shade: 2-cycle PRIM * SHADE then ENV * COMBINED, a shade past 255 is not black", 12, 3, c5551(198, 198, 198, 1));
 
     /* 11. A 2-cycle pixel's second combiner cycle takes the first cycle's TEXEL1 as its TEXEL0: the next tile's sample (the N64's;
      * Mario Golf's ground reads (COMBINED - TEXEL0) * A + TEXEL0 there, the RGBA16 grass in tile 1 under an I8 detail in tile 0).

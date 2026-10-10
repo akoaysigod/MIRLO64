@@ -111,7 +111,7 @@ int mrdp_cmd_len(uint32_t w0);   /* 64-bit words, from a command's first word */
  *
  * The pixel pipeline is the N64's (Angrylion's; the
  * combiner is ((A - B) * C + D * 256 + 0x80) >> 8, 1 = 256, mrdp.c cc_eval;
- * the shade enters it with 9 bits, 0..511, not clamped to a byte):
+ * the shade enters it clamped to a byte, 0..255):
  *   alpha      CVG_X_ALPHA: cvg = (a * cvg + 4) >> 8, a = (a * cvg + 4) >> 3
  *              (a = 256 where the combiner's alpha is 255 or overflows);
  *              ALPHA_CVG_SEL: a = cvg << 5; else a += the alpha dither

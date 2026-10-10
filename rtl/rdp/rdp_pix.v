@@ -104,19 +104,14 @@ module rdp_pix (
         clamp8 = v < 0 ? 8'd0 : (v > 255 ? 8'd255 : v[7:0]);
     endfunction
 
-    function automatic [8:0] clamp9;
-        input signed [19:0] v;
-        clamp9 = v < 0 ? 9'd0 : (v > 511 ? 9'd511 : v[8:0]);
-    endfunction
-
     // cc_begin (sim/rdp/cc_unit.sh extracts these functions)
     // The N64's combiner arithmetic (Angrylion's; the model's cc_eval): ((A - B) * C + D * 256 + 0x80) >> 8
     // kept to 9 bits. "1" is 256 (A and D), C a plain 0..255 (255 is 255/256).
     // The operands arrive extended, by their source (cc_xab, cc_xc below and
     // the selects): A, B and C 10 bits signed, D 9 bits (only its low 9 count
-    // in the sum). TEXEL, PRIMITIVE, ENV, ONE are 0..256; the SHADE is 0..511
-    // (saturated to 9 bits by the interpolator), a plain positive number as A, B, C and D
-    // (RDP_CombineColor.vhd:79-141: 7x"00" & shade); COMBINED, the first
+    // in the sum). TEXEL, PRIMITIVE, ENV, ONE are 0..256; the SHADE is 0..255
+    // (saturated to a byte by the interpolator, below), a plain positive number as A, B, C and D
+    // (zero-extended); COMBINED, the first
     // cycle's result, is its 9 raw bits: as A, B, D 0..383, or -128..-1 when
     // bits 8:7 are both set; as C a signed 9-bit.
     // Only the low 17 bits of the sum matter. The 0x80 only carries out of
@@ -246,10 +241,12 @@ module rdp_pix (
     reg        bs0, bs1, bs2, bs3, bs4, bs5, bs6, bs7, bs8, bs8t, bs8b, bs9, bs10a, bs10, bs11a, bs11, bs12a, bs12, bs13a;
     reg [31:0] s0r, t0r, w0r;
     reg [35:0] shade0;
-    // the shade, as the interpolator gives it, saturated to 9 bits -- 0 below 0, 511 above;
-    // the combiner takes it as 0..511 (not clamped to a byte), the blender's alpha clamps it at 255 (sha11)
-    wire [8:0] sr9 = clamp9($signed(in_r[31:16])), sg9 = clamp9($signed(in_g[31:16]));
-    wire [8:0] sb9 = clamp9($signed(in_b[31:16])), sa9 = clamp9($signed(in_a[31:16]));
+    // the shade, as the interpolator gives it, saturated to a byte -- 0 below 0, 255 above -- and carried as 9 bits (bit 8 clear).
+    // A shade past 255 (a highlight's overshoot at a lit surface's edge: Link's tunic with Navi's light) never goes into the
+    // combiner as it is: with 9 bits TEXEL0 * SHADE overshot 255 and, read as COMBINED in the second cycle of a 2-cycle
+    // combiner (ENV * COMBINED), it became negative: black pixels.
+    wire [8:0] sr9 = {1'b0, clamp8($signed(in_r[31:16]))}, sg9 = {1'b0, clamp8($signed(in_g[31:16]))};
+    wire [8:0] sb9 = {1'b0, clamp8($signed(in_b[31:16]))}, sa9 = {1'b0, clamp8($signed(in_a[31:16]))};
     // the samples: the coverage (their count), and -- a triangle -- the first
     // covered one (the lowest subscanline, its leftmost sample) in quarter
     // pixels from the pixel's top-left corner, where Z is taken (the attributes

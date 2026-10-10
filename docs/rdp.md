@@ -139,17 +139,15 @@ with a second small memory of the TLUT's entries for the lookup.
   by one in about 40 % of channels.) NOISE, KEY and CONVERT inputs read 0.
   `sim/rdp/cc_unit.sh` checks the RTL's functions against the model's over
   2 x 10^9 operand sets; TEXEL1's samples are 8-bit operands like TEXEL0's.
-  * **SHADE is 9 bits, 0..511** (as on the console: the interpolated
-    value saturates below 0 to 0 and above 511 to 511; the combiner takes it
-    zero-extended, a plain positive number, as A, B, C and D, colour and alpha).
-    A shade that overshoots 255 therefore goes into the arithmetic as it is, and
-    a result past 383 wraps to 0 like any other (a SHADE of 511 as D is 0, not
-    255). The blender's shade alpha is clamped at 255 after the alpha dither
-    is added. Before, the interpolator clamped
-    each channel to a byte. The shade registers carry the 9th bit down to
-    the combiner (+4 bits a stage), and the combiner's operands are registered
-    already extended (A, B, C 10 bits signed, D 9): the multiplier is 11 x 10
-    (was 11 x 9). `test_cvg.c` section 10.
+  * **SHADE is a byte, 0..255** when it enters the combiner: the interpolated
+    value is saturated below 0 to 0 and above 255 to 255, a plain positive number
+    as A, B, C and D (colour and alpha); the blender's shade alpha is clamped at 255
+    after the alpha dither is added. (With 9 bits, 0..511, a lit surface's shade
+    overshoots 255 at its edges -- Link's tunic with Navi's light: 270..330 at the
+    shoulder -- and OoT's tunic is a 2-cycle `TEXEL0 * SHADE` then `ENV * COMBINED`:
+    the first cycle's raw 9 bits reached 256 and over, and as COMBINED, the second
+    cycle's C, they are a negative number: black pixels, which the N64 does not
+    show.) `test_cvg.c` section 10.
   * **TEXEL1** in the first cycle of a 2-cycle pixel is the next tile's
     sample (tile + 1, wrapping at 8) at the same S, T: OoT's skybox draws
     `(TEXEL1 - TEXEL0) * PRIM_ALPHA + TEXEL0`, the day's two textures

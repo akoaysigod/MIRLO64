@@ -16,7 +16,6 @@ static inline int32_t sext(uint32_t v, int bits)
     return (int32_t)(v << (32 - bits)) >> (32 - bits);
 }
 static inline int clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
-static inline int clamp9(int v) { return v < 0 ? 0 : v > 511 ? 511 : v; }
 
 int mrdp_cmd_len(uint32_t w0)
 {
@@ -287,7 +286,7 @@ typedef struct {
     mrdp_rgba_t tex1;              /* TEXEL1: (MRDP_N64: the next tile's sample in the first cycle of a 2-cycle pixel, else TEXEL0 again) */
 #ifdef MRDP_CVG
     int cm9[4];                    /* COMBINED (the first cycle's result): r, g, b, a as the 9 raw bits (below) */
-    int sh9[4];                    /* SHADE: r, g, b, a saturated to 9 bits, 0..511 (below) */
+    int sh9[4];                    /* SHADE: r, g, b, a saturated to a byte, 0..255 (below; 9 bits wide as the RTL's) */
 #endif
 } cc_in_t;
 #define CC_TEX1(in) ((in)->tex1)
@@ -297,11 +296,13 @@ typedef struct {
  * 256 (A, D), C is a plain 0..255 (an 8-bit 255 is 255/256 -- the hardware
  * cannot weigh by exactly 1). COMBINED (the first cycle's result, 9 raw bits)
  * is read as A or B as 0..383 if it is below 0x180 and as -128..-1 above, as C
- * as a signed 9-bit (combine_raw). The SHADE enters with 9 bits, 0..511 -- the
- * interpolator saturates it there (below 0 -> 0, above 511 -> 511) -- and is a
- * plain positive number in A, B, C and D (the hardware's RGBA correction stage; the
- * CombineColor and CombineAlpha stages take it as `7x"00" & shade` and
- * `'0' & shade_a`); the blender's shade alpha is clamped at 255 (blend_n64).
+ * as a signed 9-bit (combine_raw). The SHADE enters saturated to a byte -- the
+ * interpolator takes it below 0 to 0 and above 255 to 255 -- and is a plain
+ * positive number in A, B, C and D; the blender's shade alpha is clamped at 255
+ * (blend_n64). (With 9 bits, 0..511, a lit surface's shade overshoots 255 at its
+ * edges, TEXEL0 * SHADE reached 256 and over, and as COMBINED -- the second
+ * cycle's C, ENV * COMBINED -- that is a negative number: black pixels on Link's
+ * tunic with Navi's light.)
  * The result's 9 bits: a colour clamps them (bits 8:7
  * both set -> 0, bit 8 -> 255), an alpha likewise but to 256 for bit 8 and
  * for exactly 255 (cc_alpha_res). */
@@ -730,11 +731,11 @@ static void draw_pixel_cvg(mrdp_t *r, const prim_t *pr, int x, int y, const int3
     mrdp_rgba_t tex_next = { 0, 0, 0, 0 };   /* the next tile's sample (TEXEL1 of the first cycle) */
     int have_next = 0;
     if (pr->shade) {
-        /* saturated to 9 bits, 0..511 (the combiner's; mrdp.c cc_eval) */
-        in.sh9[0] = clamp9(at[AR] >> 16);
-        in.sh9[1] = clamp9(at[AG] >> 16);
-        in.sh9[2] = clamp9(at[AB] >> 16);
-        in.sh9[3] = clamp9(at[AA] >> 16);
+        /* saturated to a byte: a shade past 255 enters the combiner as 255 (see the comment above cc_in_t) */
+        in.sh9[0] = clamp8(at[AR] >> 16);
+        in.sh9[1] = clamp8(at[AG] >> 16);
+        in.sh9[2] = clamp8(at[AB] >> 16);
+        in.sh9[3] = clamp8(at[AA] >> 16);
     }
     {
         /* A primitive without texture coefficients (a triangle whose command has no S, T, W block; a fill rectangle)
