@@ -1,0 +1,60 @@
+{
+  "data": {
+    "magic": "APF_VER_1",
+    "data_slots": [
+      {
+        "name": "Game",
+        "id": 0,
+        "required": true,
+        "parameters": "0x109",
+        "extensions": [
+          "z64",
+          "bin"
+        ],
+        "address": "0x00100000",
+        "size_maximum": "0x4000000"
+      },
+      {
+        "name": "Save",
+        "id": 1,
+        "required": false,
+        "parameters": "0x24",
+        "nonvolatile": true,
+        "extensions": [
+          "sav"
+        ],
+        "size_maximum": "0x20000",
+        "address": "0x07320000"
+      },
+      {
+        "name": "Controller Pak",
+        "id": 2,
+        "required": false,
+        "parameters": "0x24",
+        "nonvolatile": true,
+        "extensions": [
+          "mpk"
+        ],
+        "size_maximum": "0x8000",
+        "address": "0x07308000"
+      },
+      {
+        "name": "Runtime",
+        "id": 3,
+        "required": true,
+        "parameters": "0x08",
+        "filename": "n64rt.sys",
+        "address": "0x00000000"
+      },
+      {
+        "name": "Save-type database",
+        "id": 4,
+        "required": false,
+        "parameters": "0x08",
+        "filename": "n64savedb.txt",
+        "size_maximum": "0x10000",
+        "address": "0x07100000"
+      }
+    ]
+  }
+}

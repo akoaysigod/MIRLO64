@@ -1,0 +1,8 @@
+# The RDP for the N64's own command stream (rtl/rdp), with the RSP under
+# MIRLO_RSP. (mrdp_sdpram.v and mrdp_rcp_rom.v are MRDP's: rtl/mrdp.qip.)
+set_global_assignment -name VERILOG_FILE       [file join $::quartus(qip_path) "rdp/rdp_top.v"]
+set_global_assignment -name VERILOG_FILE       [file join $::quartus(qip_path) "rdp/rdp_pix.v"]
+set_global_assignment -name VERILOG_FILE       [file join $::quartus(qip_path) "rdp/rdp_mem.v"]
+set_global_assignment -name VERILOG_FILE       [file join $::quartus(qip_path) "rdp/rdp_zmem.v"]
+set_global_assignment -name VERILOG_FILE       [file join $::quartus(qip_path) "rdp/rdp_tmem.v"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "rdp/rdp_dpc.sv"]

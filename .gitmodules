@@ -1,0 +1,6 @@
+[submodule "vendor/pythondata-software-picolibc"]
+	path = vendor/pythondata-software-picolibc
+	url = https://github.com/litex-hub/pythondata-software-picolibc
+[submodule "vendor/pythondata-software-compiler_rt"]
+	path = vendor/pythondata-software-compiler_rt
+	url = https://github.com/litex-hub/pythondata-software-compiler_rt

@@ -1,0 +1,50 @@
+#!/bin/bash
+# Upload a bare-metal .bin to Mirlo over JTAG (USB Blaster) and drop into its
+# console. Mirlo's boot ROM (lang/mips/boot) falls back to SFL serial boot
+# when the Pocket has not loaded a game (a bitstream loaded over JTAG, see
+# jtag_program_and_run.sh), and asks for a program every half second; this
+# script's sfl_term.py answers the SFL magic and uploads.
+#
+#   ./jtag_boot.sh path/to/build.bin
+#
+# Why the custom relay (jtag_uart_relay.py) instead of a generic OpenOCD JTAG
+# UART bridge: the JTAG UART's transfer FSM resets on every Capture-DR
+# (fsm.reset.eq(jtag.reset | jtag.capture)), which re-clears the `ready` bit
+# before the host can read it -> host->target bytes are silently dropped, upload
+# stalls at frame 0 forever. The relay keeps the TAP parked in Pause-DR between
+# scans (openocd `drscan -endstate DRPAUSE`), so Pause-DR -> Exit2-DR -> Shift-DR
+# never touches Capture-DR and the FSM (and flow-control `ready`) persist.
+set -eu
+
+BIN="${1:?usage: jtag_boot.sh path/to/build.bin [kernel_adr]}"
+KERNEL_ADR="${2:-0x40000000}"   # where SFL uploads the .bin and then jumps
+HERE="$(cd "$(dirname "$0")" && pwd)"
+LOG="${TMPDIR:-/tmp}/jtag_boot.$$"
+
+command -v openocd >/dev/null || { echo "openocd not found"; exit 1; }
+[ -e "$BIN" ] || { echo "no such file: $BIN"; exit 1; }
+
+cleanup() { kill $OO_PID $RELAY_PID 2>/dev/null || true; }
+trap cleanup EXIT
+
+echo "[1/3] openocd (TCL-RPC :6666)"
+openocd -f "$HERE/openocd_rpc.cfg" > "$LOG.oo" 2>&1 &
+OO_PID=$!
+for _ in $(seq 1 40); do grep -q 'tap/device found' "$LOG.oo" && break; sleep 0.5; done
+grep -q 'tap/device found' "$LOG.oo" || { echo "  TAP not found:"; tail -5 "$LOG.oo"; exit 1; }
+
+echo "[2/3] jtag_uart_relay.py"
+python3 -u "$HERE/jtag_uart_relay.py" > "$LOG.relay" 2>&1 &
+RELAY_PID=$!
+PTS=""
+for _ in $(seq 1 40); do PTS="$(sed -n 1p "$LOG.relay" 2>/dev/null || true)"; [ -n "$PTS" ] && [ -e "$PTS" ] && break; sleep 0.25; done
+[ -e "$PTS" ] || { echo "  relay pty not ready:"; cat "$LOG.relay"; exit 1; }
+echo "  pty = $PTS"
+
+case "$BIN" in
+  *.json) MODE=(--images "$BIN") ;;                                   # multi-image manifest {file: addr}
+  *)      MODE=(--kernel "$BIN" --kernel-adr "$KERNEL_ADR") ;;
+esac
+echo "[3/3] sfl_term.py --serial-boot ${MODE[*]}"
+echo "      >>> now on the Pocket: Core Settings -> Reset core -> A <<<"
+exec python3 "$HERE/sfl_term.py" --serial-boot "${MODE[@]}" "$PTS"

@@ -1,0 +1,1570 @@
+/* MRDP bit-exact reference model -- see mrdp.h (the contract) and
+ * docs/mrdp.md (the design). Integer arithmetic only; every shift, round and
+ * clamp here is what the RTL does. */
+#include "mrdp.h"
+#include "mrdp_setup.h"
+
+#include <string.h>
+#if defined(MRDP_DEBUG_PIXEL) || defined(MRDP_DEBUG_AA)
+#include <stdio.h>
+#endif
+
+/* ---- helpers ------------------------------------------------------------ */
+
+static inline int32_t sext(uint32_t v, int bits)
+{
+    return (int32_t)(v << (32 - bits)) >> (32 - bits);
+}
+static inline int clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+static inline int clamp9(int v) { return v < 0 ? 0 : v > 511 ? 511 : v; }
+
+int mrdp_cmd_len(uint32_t w0)
+{
+    unsigned op = (w0 >> 24) & 0x3F;
+    if (op >= 0x08 && op <= 0x0F)
+        return 4 + ((op & 4) ? 8 : 0) + ((op & 2) ? 8 : 0) + ((op & 1) ? 2 : 0);
+#ifdef MRDP_N64
+    /* (the N64's commands only: MRDP's own triangles are unknown ones) */
+    return (op == MRDP_OP_TEXRECT || op == MRDP_OP_TEXRECT_FLIP) ? 2 : 1;
+#endif
+    if (op == MRDP_OP_TRI_R)
+        return (int)(mrdp_tri_r_words((w0 >> 19) & 7u) / 2u);
+    if (op >= MRDP_OP_TRI_V && op <= (MRDP_OP_TRI_V | 7u))
+        return (int)(mrdp_tri_v_words(op & 7u) / 2u);
+    if (op >= MRDP_OP_TRI_G && op <= (MRDP_OP_TRI_G | 7u))
+        return (int)(mrdp_tri_g_words(op & 7u) / 2u);
+    switch (op) {
+    case MRDP_OP_TEXRECT: case MRDP_OP_TEXRECT_FLIP:
+        return 2;
+    case MRDP_OP_NOP: case MRDP_OP_SYNC_LOAD: case MRDP_OP_SYNC_PIPE:
+    case MRDP_OP_SYNC_TILE: case MRDP_OP_SYNC_FULL: case MRDP_OP_SET_SCISSOR:
+    case MRDP_OP_SET_PRIM_Z: case MRDP_OP_SET_OTHER: case MRDP_OP_SET_TILESIZE:
+    case MRDP_OP_LOAD_TILE: case MRDP_OP_SET_TILE: case MRDP_OP_FILL_RECT:
+    case MRDP_OP_SET_FILL: case MRDP_OP_SET_FOG: case MRDP_OP_SET_BLEND:
+    case MRDP_OP_SET_PRIM: case MRDP_OP_SET_ENV: case MRDP_OP_SET_COMBINE:
+    case MRDP_OP_SET_TIMG: case MRDP_OP_SET_ZIMG: case MRDP_OP_SET_CIMG:
+        return 1;
+    default:
+        return 1;   /* unknown: one word, counted and skipped */
+    }
+}
+
+/* ---- perspective: 1/W from a 64-entry table + linear step ---------------
+ * W > 0 is normalised so bit 30 is its top bit (wn = W << sh). With
+ * idx = wn[29:24] and frac = wn[23:15]:
+ *   r = P[idx] - ((D[idx] * frac) >> 9),  P[i] = round(2^22 / (64 + i))
+ * so r ~ 2^16 / m for the mantissa m = wn / 2^30 in [1, 2), r in [2^15, 2^16].
+ * Then S/W in s10.5 is (S * r) >> (27 - sh), W being 2.30 (1.0 = 2^30). */
+static uint32_t s_rcp_p[65], s_rcp_d[64];
+static int s_rcp_ready;
+
+static void rcp_init(void)
+{
+    for (int i = 0; i <= 64; i++)
+        s_rcp_p[i] = ((1u << 23) / (64 + i) + 1) >> 1;   /* round(2^22/(64+i)) */
+    for (int i = 0; i < 64; i++)
+        s_rcp_d[i] = s_rcp_p[i] - s_rcp_p[i + 1];
+    s_rcp_ready = 1;
+}
+
+uint32_t mrdp_rcp(uint32_t w, int *shift)
+{
+    if (!s_rcp_ready) rcp_init();
+    if ((int32_t)w <= 0) w = 1;
+    int sh = __builtin_clz(w) - 1;
+    uint32_t wn = w << sh;
+    uint32_t idx = (wn >> 24) & 63, frac = (wn >> 15) & 511;
+    *shift = sh;
+    return s_rcp_p[idx] - ((s_rcp_d[idx] * frac) >> 9);
+}
+
+int32_t mrdp_persp(int32_t s, uint32_t w)
+{
+    int sh;
+    uint32_t r = mrdp_rcp(w, &sh);
+    if (s > (1 << 26) - 1) s = (1 << 26) - 1;       /* the 27-bit multiplier input */
+    if (s < -(1 << 26)) s = -(1 << 26);
+    int64_t p = (int64_t)s * (int64_t)r;
+    int k = 27 - sh;                  /* W is 2.30 (mrdp_slope30): 41 - 14 */
+    int64_t v = p >> (k > 0 ? k : 0); /* saturated as the RTL's 45-bit product */
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return (int32_t)v;
+}
+
+static inline int32_t s105_noperp(int32_t s)
+{
+    int32_t v = s >> 11;
+    return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+}
+
+/* ---- init / state ------------------------------------------------------- */
+
+void mrdp_init(mrdp_t *r, void *ctx, mrdp_rd16_t rd16, mrdp_wr16_t wr16)
+{
+    memset(r, 0, sizeof *r);
+    r->ctx = ctx;
+    r->rd16 = rd16;
+    r->wr16 = wr16;
+    r->cimg_width = 1;
+    r->timg_width = 1;
+    r->sc_xl = 1023 << 2;
+    r->sc_yl = 1023 << 2;
+    r->dbg_x = r->dbg_y = -1;
+    if (!s_rcp_ready) rcp_init();
+}
+
+static inline mrdp_rgba_t rgba_of(uint32_t w)
+{
+    mrdp_rgba_t c = { (uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w };
+    return c;
+}
+
+/* ---- TMEM --------------------------------------------------------------- */
+
+static inline void tmem_locate(const mrdp_tile_t *t, int s, int tt, int *bank, int *addr)
+{
+    *bank = ((tt & 1) << 1) | (s & 1);
+    *addr = (t->tmem + (tt >> 1) * t->line * 2 + (s >> 1)) & 1023;
+}
+
+static mrdp_rgba_t texel_expand(unsigned fmt, uint16_t v)
+{
+    mrdp_rgba_t c;
+    switch (fmt) {
+    case 1:     /* IA88 */
+        c.r = c.g = c.b = (uint8_t)(v >> 8);
+        c.a = (uint8_t)v;
+        break;
+    case 2: {   /* RGBA4444 */
+        c.r = (uint8_t)(((v >> 12) & 15) * 17);
+        c.g = (uint8_t)(((v >> 8) & 15) * 17);
+        c.b = (uint8_t)(((v >> 4) & 15) * 17);
+        c.a = (uint8_t)((v & 15) * 17);
+        break;
+    }
+    default: {  /* RGBA5551 */
+        unsigned r5 = (v >> 11) & 31, g5 = (v >> 6) & 31, b5 = (v >> 1) & 31;
+        c.r = (uint8_t)(r5 << 3 | r5 >> 2);
+        c.g = (uint8_t)(g5 << 3 | g5 >> 2);
+        c.b = (uint8_t)(b5 << 3 | b5 >> 2);
+        c.a = (v & 1) ? 255 : 0;
+        break;
+    }
+    }
+    return c;
+}
+
+#ifdef MRDP_N64
+/* TMEM as the N64's: 4 KiB, here 2048 16-bit words (tmem16[i] is bytes 2i,
+ * 2i + 1). A tile's rows are `line` 64-bit words apart from `tmem`; a texel is
+ * found by the tile's size:
+ *   4-bit    word tmem*4 + t*line*4 + s/4, its nibble s%4 (the first the highest)
+ *   8-bit    word ... + s/2, its byte s%2
+ *   16-bit   word ... + s
+ *   32-bit   R G in word (...+ s) of the lower half, B A in the same word of
+ *            the upper half (as the N64 keeps them: LOAD BLOCK / LOAD TILE
+ *            split a 32-bit RGBA texture so)
+ * and decoded by the tile's format. With the TLUT on, a 4- or 8-bit texel is
+ * an index: its colour is the 16-bit word 4*index of the upper half (LOAD
+ * TLUT writes every entry four times, as the N64).
+ * On an odd row the two halves of each 64-bit word change places (the word
+ * found is word ^ 2), as they did when the row was loaded -- the N64's, which
+ * shows when a load's rows are not the tile's: a LOAD BLOCK with dxt 0 loads
+ * every row as an even one, and a game that does that keeps its texture's
+ * odd rows swapped in the ROM (Pilotwings 64's). */
+static mrdp_rgba_t tmem_fetch(const mrdp_t *r, const mrdp_tile_t *t, int s, int tt)
+{
+    const uint16_t *m = r->tmem16;
+    s &= 0x7FF; tt &= 0x7FF;                         /* (the texture unit's 11 bits) */
+    uint32_t row = (uint32_t)t->tmem * 4u + (uint32_t)tt * (uint32_t)t->line * 4u;
+    const uint32_t odd = (tt & 1) ? 2u : 0u;
+    mrdp_rgba_t c = { 0, 0, 0, 0 };
+    if (t->size == 3) {
+        uint32_t i = ((row + (uint32_t)s) ^ odd) & 0x3FF;
+        c.r = (uint8_t)(m[i] >> 8); c.g = (uint8_t)m[i];
+        c.b = (uint8_t)(m[0x400 | i] >> 8); c.a = (uint8_t)m[0x400 | i];
+        return c;
+    }
+    unsigned v = m[((row + ((uint32_t)s >> (2 - t->size))) ^ odd) & 0x7FF];
+    unsigned n = (v >> (12 - 4 * (s & 3))) & 15u;                 /* the 4-bit texel */
+    unsigned b = (s & 1) ? (v & 255u) : (v >> 8);                 /* the 8-bit one */
+    if ((r->other_h & MRDP_H_TLUT_EN) && t->size < 2) {
+        unsigned idx = t->size == 0 ? ((unsigned)t->palette << 4 | n) : b;
+        return texel_expand((r->other_h & MRDP_H_TLUT_IA) ? 1 : 0, m[0x400 | (idx << 2)]);
+    }
+    if (t->size == 2) {
+        if (t->fmt == 3) return texel_expand(1, (uint16_t)v);     /* IA 8 8 */
+        if (t->fmt <= 2) return texel_expand(0, (uint16_t)v);     /* RGBA 5551 (YUV: not decoded; CI 16 is read as RGBA, as in Clayfighter's logo) */
+        c.r = c.g = c.b = c.a = (uint8_t)(v >> 8);                /* I: the first byte */
+    } else if (t->size == 1) {
+        if (t->fmt == 3) { c.r = c.g = c.b = (uint8_t)((b >> 4) * 17u); c.a = (uint8_t)((b & 15u) * 17u); }   /* IA 4 4 */
+        else c.r = c.g = c.b = c.a = (uint8_t)b;                  /* I (and what has no 8-bit form) */
+    } else {
+        if (t->fmt == 3) { unsigned i3 = n >> 1; c.r = c.g = c.b = (uint8_t)(i3 << 5 | i3 << 2 | i3 >> 1); c.a = (n & 1u) ? 255 : 0; }   /* IA 3 1 */
+        else c.r = c.g = c.b = c.a = (uint8_t)(n * 17u);          /* I */
+    }
+    return c;
+}
+#else
+static mrdp_rgba_t tmem_fetch(const mrdp_t *r, const mrdp_tile_t *t, int s, int tt)
+{
+    int bank, addr;
+    tmem_locate(t, s, tt, &bank, &addr);
+    return texel_expand(t->fmt, r->tmem[bank][addr]);
+}
+#endif
+
+/* ---- texture coordinate: shift, tile origin, clamp, mirror, mask ------ */
+
+static int32_t tc_shift(int32_t v, unsigned shift)
+{
+    if (shift == 0) return v;
+    if (shift <= 10) return v >> shift;
+    return v << (16 - shift);
+}
+
+/* one axis: v in s10.5 after shift; returns the two integer texel
+ * coordinates (v0, v0+1 after wrap) and the 5-bit fraction */
+static void tc_axis(int32_t v, unsigned lo, unsigned hi, unsigned clampbit,
+                    unsigned mirror, unsigned mask, int *c0, int *c1, int *frac)
+{
+    v -= (int32_t)lo << 3;                        /* u10.2 -> s10.5 */
+    int i = v >> 5, f = v & 31;
+    int j = i + 1;
+    if (clampbit || mask == 0) {
+        int mx = ((int)hi - (int)lo) >> 2;
+        if (i < 0) { i = 0; j = 0; f = 0; }
+        else if (i >= mx) { i = mx; j = mx; f = 0; }
+    }
+    if (mask) {
+        int m = (1 << mask) - 1;
+        if (mirror && ((i >> mask) & 1)) i = ~i;
+        if (mirror && ((j >> mask) & 1)) j = ~j;
+        i &= m;
+        j &= m;
+    }
+    *c0 = i;
+    *c1 = j;
+    *frac = f;
+}
+
+static mrdp_rgba_t texture_sample(const mrdp_t *r, int tilei, int32_t s105, int32_t t105)
+{
+    const mrdp_tile_t *t = &r->tile[tilei & 7];
+    int32_t s = tc_shift(s105, t->shifts), tt = tc_shift(t105, t->shiftt);
+    int s0, s1, t0, t1, fs, ft;
+    tc_axis(s, t->uls, t->lrs, t->cs, t->ms, t->masks, &s0, &s1, &fs);
+    tc_axis(tt, t->ult, t->lrt, t->ct, t->mt, t->maskt, &t0, &t1, &ft);
+
+    mrdp_rgba_t a = tmem_fetch(r, t, s0, t0);
+    if (((r->other_h >> MRDP_H_FILT_SHIFT) & 3) == 0)   /* point */
+        return a;
+
+    /* N64 3-point filter: the triangle of the 2x2 the sample falls in */
+    mrdp_rgba_t b = tmem_fetch(r, t, s1, t0);
+    mrdp_rgba_t c = tmem_fetch(r, t, s0, t1);
+    mrdp_rgba_t d = tmem_fetch(r, t, s1, t1);
+    mrdp_rgba_t o;
+    const uint8_t *pa = &a.r, *pb = &b.r, *pc = &c.r, *pd = &d.r;
+    uint8_t *po = &o.r;
+    int upper = fs + ft < 32;
+    for (int k = 0; k < 4; k++) {
+        int v;
+        if (upper)
+            v = pa[k] + (((pb[k] - pa[k]) * fs + (pc[k] - pa[k]) * ft + 16) >> 5);
+        else
+            v = pd[k] + (((pc[k] - pd[k]) * (32 - fs) + (pb[k] - pd[k]) * (32 - ft) + 16) >> 5);
+        po[k] = (uint8_t)clamp8(v);
+    }
+    return o;
+}
+
+/* ---- color combiner: (A - B) * C + D, N64 selections -------------------- */
+
+typedef struct {
+    mrdp_rgba_t tex, shade, combined;
+    mrdp_rgba_t tex1;              /* TEXEL1: (MRDP_N64: the next tile's sample in the first cycle of a 2-cycle pixel, else TEXEL0 again) */
+#ifdef MRDP_CVG
+    int cm9[4];                    /* COMBINED (the first cycle's result): r, g, b, a as the 9 raw bits (below) */
+    int sh9[4];                    /* SHADE: r, g, b, a saturated to 9 bits, 0..511 (below) */
+#endif
+} cc_in_t;
+#define CC_TEX1(in) ((in)->tex1)
+#ifdef MRDP_CVG
+/* The N64's combiner arithmetic (the hardware's CombineColor / CombineAlpha stages,
+ * Angrylion's): ((A - B) * C + (D << 8) + 0x80) >> 8, kept to 9 bits; "1" is
+ * 256 (A, D), C is a plain 0..255 (an 8-bit 255 is 255/256 -- the hardware
+ * cannot weigh by exactly 1). COMBINED (the first cycle's result, 9 raw bits)
+ * is read as A or B as 0..383 if it is below 0x180 and as -128..-1 above, as C
+ * as a signed 9-bit (combine_raw). The SHADE enters with 9 bits, 0..511 -- the
+ * interpolator saturates it there (below 0 -> 0, above 511 -> 511) -- and is a
+ * plain positive number in A, B, C and D (the hardware's RGBA correction stage; the
+ * CombineColor and CombineAlpha stages take it as `7x"00" & shade` and
+ * `'0' & shade_a`); the blender's shade alpha is clamped at 255 (blend_n64).
+ * The result's 9 bits: a colour clamps them (bits 8:7
+ * both set -> 0, bit 8 -> 255), an alpha likewise but to 256 for bit 8 and
+ * for exactly 255 (cc_alpha_res). */
+#define CC_ONE 256
+#define CC_CM(in, ch) ((in)->cm9[ch])
+#define CC_SH(in, ch) ((in)->sh9[ch])
+#else
+#define CC_ONE 255
+#define CC_CM(in, ch) ((int)(&(in)->combined.r)[ch])
+#define CC_SH(in, ch) ((int)(&(in)->shade.r)[ch])
+#endif
+
+static int cc_rgb_a(const mrdp_t *r, const cc_in_t *in, unsigned sel, int ch)
+{
+    const uint8_t *tex = &in->tex.r;
+    const uint8_t *pr = &r->prim.r, *en = &r->env.r, *tx1 = &CC_TEX1(in).r;
+    switch (sel) {
+    case 0: return CC_CM(in, ch);
+    case 1: return tex[ch];
+    case 2: return tx1[ch];
+    case 3: return pr[ch];
+    case 4: return CC_SH(in, ch);
+    case 5: return en[ch];
+    case 6: return CC_ONE;
+    default: return 0;           /* 7 noise, 8+ zero */
+    }
+}
+static int cc_rgb_b(const mrdp_t *r, const cc_in_t *in, unsigned sel, int ch)
+{
+    if (sel >= 6) return 0;       /* 6 key center, 7 K4, 8+ zero */
+    return cc_rgb_a(r, in, sel, ch);
+}
+static int cc_rgb_c(const mrdp_t *r, const cc_in_t *in, unsigned sel, int ch)
+{
+    switch (sel) {
+    case 0: case 1: case 2: case 3: case 4: case 5:
+        return cc_rgb_a(r, in, sel, ch);
+    case 7: return CC_CM(in, 3);
+    case 8: return in->tex.a;
+    case 9: return CC_TEX1(in).a;
+    case 10: return r->prim.a;
+    case 11: return CC_SH(in, 3);
+    case 12: return r->env.a;
+    case 14: return r->prim_lod_frac;
+    default: return 0;           /* 6 key scale, 13 LOD fraction, 15 K5, 16+ */
+    }
+}
+static int cc_rgb_d(const mrdp_t *r, const cc_in_t *in, unsigned sel, int ch)
+{
+    return sel == 7 ? 0 : cc_rgb_a(r, in, sel, ch);   /* 6 = 1 */
+}
+static int cc_alpha_abd(const mrdp_t *r, const cc_in_t *in, unsigned sel)
+{
+    switch (sel) {
+    case 0: return CC_CM(in, 3);
+    case 1: return in->tex.a;
+    case 2: return CC_TEX1(in).a;
+    case 3: return r->prim.a;
+    case 4: return CC_SH(in, 3);
+    case 5: return r->env.a;
+    case 6: return CC_ONE;
+    default: return 0;
+    }
+}
+static int cc_alpha_c(const mrdp_t *r, const cc_in_t *in, unsigned sel)
+{
+    switch (sel) {
+    case 1: return in->tex.a;
+    case 2: return CC_TEX1(in).a;
+    case 3: return r->prim.a;
+    case 4: return CC_SH(in, 3);
+    case 5: return r->env.a;
+    case 6: return r->prim_lod_frac;
+    default: return 0;           /* 0 LOD fraction, 7 zero */
+    }
+}
+
+#ifdef MRDP_CVG
+static inline int cc_ext9(int v) { return (v & 0x180) == 0x180 ? v - 512 : v; }
+static inline int cc_sgn9(int v) { return (v & 0x100) ? v - 512 : v; }
+/* the raw 9 bits of ((a - b) * c + (d << 8) + 0x80) >> 8, the operands as they enter (COMBINED already extended
+ * by combine_raw: cc_ext9 as A or B, cc_sgn9 as C; D's low 9 bits are all that count) */
+static inline int cc_eval(int a, int b, int c, int d)
+{
+    return ((((a - b) * c) + d * 256 + 0x80) >> 8) & 0x1FF;
+}
+static inline int cc_color_res(int v9) { return (v9 & 0x180) == 0x180 ? 0 : (v9 & 0x100) ? 255 : v9 & 0xFF; }
+/* an alpha: 0..256 (256 for an overflow and for exactly 255) */
+static inline int cc_alpha_res(int v9) { return (v9 & 0x180) == 0x180 ? 0 : ((v9 & 0x100) || (v9 & 0xFF) == 0xFF) ? 256 : v9 & 0xFF; }
+#else
+/* (a - b) * c + d with c = 255 meaning 1.0 */
+static inline int cc_eval(int a, int b, int c, int d)
+{
+    int cw = c + (c >> 7);
+    return clamp8((((a - b) * cw) >> 8) + d);
+}
+#endif
+
+/* does the first combiner cycle of a 2-cycle pixel read TEXEL1? (rtl/rdp rdp_pix.v two_pass is the same test on
+ * the same fields: a pixel that does takes two clocks, the tile's sample and the next tile's) */
+static int cc0_uses_texel1(const mrdp_t *r)
+{
+    uint32_t hi = r->combine_hi, lo = r->combine_lo;
+    unsigned sa_r = (hi >> 20) & 15, mul_r = (hi >> 15) & 31, sa_a = (hi >> 12) & 7, mul_a = (hi >> 9) & 7;
+    unsigned sb_r = (lo >> 28) & 15, add_r = (lo >> 15) & 7, sb_a = (lo >> 12) & 7, add_a = (lo >> 9) & 7;
+    return sa_r == 2 || sb_r == 2 || mul_r == 2 || mul_r == 9 || add_r == 2 ||
+           sa_a == 2 || sb_a == 2 || mul_a == 2 || add_a == 2;
+}
+
+
+/* does the second combiner cycle of a 2-cycle pixel read TEXEL0 (as a colour, or its alpha)? The N64's second cycle takes the
+ * first cycle's TEXEL1 there -- the next tile's sample -- so such a pixel needs that sample too (rtl/rdp rdp_pix.v two_pass).
+ * Mario Golf's ground: cycle 0 TEXEL0 (an I8 detail tile) * TEXEL1 (the RGBA16 grass), cycle 1 (COMBINED - TEXEL0) * A + TEXEL0 --
+ * the grass itself, which a TEXEL0 of the first tile makes a pale grey-green. */
+static int cc1_uses_texel0(const mrdp_t *r)
+{
+    uint32_t hi = r->combine_hi, lo = r->combine_lo;
+    unsigned sa_r = (hi >> 5) & 15, mul_r = hi & 31, sa_a = (lo >> 21) & 7, mul_a = (lo >> 18) & 7;
+    unsigned sb_r = (lo >> 24) & 15, add_r = (lo >> 6) & 7, sb_a = (lo >> 3) & 7, add_a = lo & 7;
+    return sa_r == 1 || sb_r == 1 || mul_r == 1 || mul_r == 8 || add_r == 1 ||
+           sa_a == 1 || sb_a == 1 || mul_a == 1 || add_a == 1;
+}
+
+/* one combiner cycle's four results: MRDP_CVG the raw 9 bits (cc_eval), else the clamped bytes */
+typedef struct { int v[4]; } cc_out_t;
+static cc_out_t combine_raw(const mrdp_t *r, const cc_in_t *in, int cyc)
+{
+    uint32_t hi = r->combine_hi, lo = r->combine_lo;
+    unsigned sa_r, mul_r, sa_a, mul_a, sb_r, sb_a, add_r, add_a;
+    if (cyc == 0) {
+        sa_r = (hi >> 20) & 15; mul_r = (hi >> 15) & 31;
+        sa_a = (hi >> 12) & 7;  mul_a = (hi >> 9) & 7;
+        sb_r = (lo >> 28) & 15; add_r = (lo >> 15) & 7;
+        sb_a = (lo >> 12) & 7;  add_a = (lo >> 9) & 7;
+    } else {
+        sa_r = (hi >> 5) & 15;  mul_r = hi & 31;
+        sa_a = (lo >> 21) & 7;  mul_a = (lo >> 18) & 7;
+        sb_r = (lo >> 24) & 15; add_r = (lo >> 6) & 7;
+        sb_a = (lo >> 3) & 7;   add_a = lo & 7;
+    }
+    cc_out_t o;
+#ifdef MRDP_CVG
+    /* COMBINED (selection 0) is the only operand that can be above 383 and mean a negative number: A and B read it
+     * as -128..-1 from 0x180, C (selection 0, or 7: COMBINED's alpha) as a signed 9-bit; the SHADE and the rest are
+     * the plain positive numbers they are */
+    for (int ch = 0; ch < 3; ch++) {
+        int a = cc_rgb_a(r, in, sa_r, ch), b = cc_rgb_b(r, in, sb_r, ch), c = cc_rgb_c(r, in, mul_r, ch);
+        if (sa_r == 0) a = cc_ext9(a);
+        if (sb_r == 0) b = cc_ext9(b);
+        if (mul_r == 0 || mul_r == 7) c = cc_sgn9(c);
+        o.v[ch] = cc_eval(a, b, c, cc_rgb_d(r, in, add_r, ch));
+    }
+    {
+        int a = cc_alpha_abd(r, in, sa_a), b = cc_alpha_abd(r, in, sb_a);
+        if (sa_a == 0) a = cc_ext9(a);
+        if (sb_a == 0) b = cc_ext9(b);
+        o.v[3] = cc_eval(a, b, cc_alpha_c(r, in, mul_a), cc_alpha_abd(r, in, add_a));
+    }
+#else
+    for (int ch = 0; ch < 3; ch++)
+        o.v[ch] = cc_eval(cc_rgb_a(r, in, sa_r, ch), cc_rgb_b(r, in, sb_r, ch),
+                          cc_rgb_c(r, in, mul_r, ch), cc_rgb_d(r, in, add_r, ch));
+    o.v[3] = cc_eval(cc_alpha_abd(r, in, sa_a), cc_alpha_abd(r, in, sb_a),
+                     cc_alpha_c(r, in, mul_a), cc_alpha_abd(r, in, add_a));
+#endif
+    return o;
+}
+static mrdp_rgba_t combine(const mrdp_t *r, const cc_in_t *in, int cyc)
+{
+    cc_out_t o = combine_raw(r, in, cyc);
+#ifdef MRDP_CVG
+    mrdp_rgba_t c = { (uint8_t)cc_color_res(o.v[0]), (uint8_t)cc_color_res(o.v[1]), (uint8_t)cc_color_res(o.v[2]),
+                      (uint8_t)clamp8(cc_alpha_res(o.v[3])) };
+#else
+    mrdp_rgba_t c = { (uint8_t)o.v[0], (uint8_t)o.v[1], (uint8_t)o.v[2], (uint8_t)o.v[3] };
+#endif
+    return c;
+}
+
+/* ---- blender: (P * a + M * b) >> 8 ------------------------------------- */
+
+static mrdp_rgba_t bl_pm(const mrdp_t *r, unsigned sel, mrdp_rgba_t pix, mrdp_rgba_t mem)
+{
+    switch (sel) {
+    case 0: return pix;
+    case 1: return mem;
+    case 2: return r->blend;
+    default: return r->fog;
+    }
+}
+
+static mrdp_rgba_t blend(const mrdp_t *r, int cyc, mrdp_rgba_t pix, mrdp_rgba_t mem,
+                         int comb_a, int shade_a)
+{
+    uint32_t l = r->other_l;
+    unsigned p = (l >> (cyc ? 28 : 30)) & 3, a = (l >> (cyc ? 24 : 26)) & 3;
+    unsigned m = (l >> (cyc ? 20 : 22)) & 3, b = (l >> (cyc ? 16 : 18)) & 3;
+    int av;
+    switch (a) {
+    case 0: av = comb_a; break;
+    case 1: av = r->fog.a; break;
+    case 2: av = shade_a; break;
+    default: av = 0; break;
+    }
+    int aw = av + (av >> 7), bw;
+    switch (b) {
+    case 0: bw = 256 - aw; break;
+    case 1: case 2: bw = 256; break;     /* memory alpha is 1: RGB565 has none */
+    default: bw = 0; break;
+    }
+    mrdp_rgba_t P = bl_pm(r, p, pix, mem), M = bl_pm(r, m, pix, mem), o;
+    o.r = (uint8_t)clamp8((P.r * aw + M.r * bw) >> 8);
+    o.g = (uint8_t)clamp8((P.g * aw + M.g * bw) >> 8);
+    o.b = (uint8_t)clamp8((P.b * aw + M.b * bw) >> 8);
+    o.a = pix.a;
+    return o;
+}
+
+static inline int bl_reads_memory(uint32_t l, int cyc)
+{
+    return ((l >> (cyc ? 28 : 30)) & 3) == 1 || ((l >> (cyc ? 20 : 22)) & 3) == 1;
+}
+
+/* ---- pixels -------------------------------------------------------------- */
+
+#ifdef MRDP_N64
+/* the colour image is the game's: RGBA5551, its low bit (the N64's coverage) set */
+static inline uint16_t rgb565(mrdp_rgba_t c)
+{
+    return (uint16_t)(((c.r >> 3) << 11) | ((c.g >> 3) << 6) | ((c.b >> 3) << 1) | 1u);
+}
+/* The N64's RGB dither (RGB_DITHER_SEL, other_h[7:6]), as rtl/rdp does it: the
+ * 8 bits go to 5 by truncation after a channel whose low three bits are above
+ * the threshold is taken up to the next step (not past 255). The threshold is
+ * the matrix's at the pixel's place on the screen: 0 magic square, 1 Bayer;
+ * 2 noise: three random bits for each channel (random9[2:0], [5:3], [8:6] of the LFSR -- the sample the pixel's alpha dither
+ * takes too); 3 off. */
+/* the matrix's value at the pixel's place: the magic square (RGB_DITHER_SEL 0,
+ * or 3: off, for the alpha dither's pattern) or the Bayer matrix (1; and 2
+ * where there is no noise: the legacy path without the N64's pixel) */
+static inline unsigned dither_d(const mrdp_t *r, int x, int y, int noise)
+{
+    static const uint8_t magic[16] = { 0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0 };
+    static const uint8_t bayer[16] = { 0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2 };
+    unsigned sel = (r->other_h >> 6) & 3;
+    unsigned i = ((unsigned)(y & 3) << 2) | (unsigned)(x & 3);
+    return (sel == 1 || (sel == 2 && !noise)) ? bayer[i] : magic[i];
+}
+/* rnd: the LFSR's value this pixel's alpha dither took (before its step) */
+static inline mrdp_rgba_t dither_n64(const mrdp_t *r, mrdp_rgba_t c, int x, int y, uint32_t rnd, int noise)
+{
+    unsigned sel = (r->other_h >> 6) & 3;
+    if (sel == 3) return c;
+    unsigned d = dither_d(r, x, y, noise);
+    uint8_t *ch[3] = { &c.r, &c.g, &c.b };
+    for (int k = 0; k < 3; k++) {
+        unsigned v = *ch[k], lo = v & 7;
+        unsigned dk = (sel == 2 && noise) ? (rnd >> (3 * k)) & 7u : d;
+        if (dk < lo && v < 248) *ch[k] = (uint8_t)((v | 7) + 1);
+        else if (dk < lo) *ch[k] = 255;
+    }
+    return c;
+}
+/* the alpha dither (ALPHA_DITHER_SEL, other_h[5:4]): the pattern, its
+ * inverse, noise (three random bits: the LFSR's [10:8]), none -- the pattern
+ * the alpha's matrix: Bayer for RGB_DITHER_SEL 1 and 3, else the magic square
+ * (Angrylion's get_dither_noise) */
+static inline unsigned dither_a(const mrdp_t *r, int x, int y, uint32_t rnd)
+{
+    static const uint8_t magic[16] = { 0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0 };
+    static const uint8_t bayer[16] = { 0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2 };
+    unsigned sel = (r->other_h >> 4) & 3, i = ((unsigned)(y & 3) << 2) | (unsigned)(x & 3);
+    unsigned d = ((r->other_h >> 6) & 1u) ? bayer[i] : magic[i];
+    return sel == 0 ? d : sel == 1 ? (~d & 7u) : sel == 2 ? (rnd >> 8) & 7u : 0;
+}
+/* the colour image's pixel as the blender reads it: the five bits with three
+ * zeros below (Angrylion's fbread GET_HI/MED/LOW) --
+ * not the top bits again: with them a translucent surface's blend of nearly
+ * the memory's own colour came out with low bits the RGB dither rounds up,
+ * one step more at each pass, at the matrix's low thresholds: a regular grid
+ * of bright dots inside every translucent rectangle drawn over and over */
+static inline mrdp_rgba_t unrgb565(uint16_t v)
+{
+    unsigned r5 = v >> 11, g5 = (v >> 6) & 31, b5 = (v >> 1) & 31;
+    mrdp_rgba_t c = { (uint8_t)(r5 << 3), (uint8_t)(g5 << 3), (uint8_t)(b5 << 3), 255 };
+    return c;
+}
+#else
+static inline uint16_t rgb565(mrdp_rgba_t c)
+{
+    return (uint16_t)(((c.r >> 3) << 11) | ((c.g >> 2) << 5) | (c.b >> 3));
+}
+static inline mrdp_rgba_t unrgb565(uint16_t v)
+{
+    unsigned r5 = v >> 11, g6 = (v >> 5) & 63, b5 = v & 31;
+    mrdp_rgba_t c = { (uint8_t)(r5 << 3 | r5 >> 2), (uint8_t)(g6 << 2 | g6 >> 4),
+                      (uint8_t)(b5 << 3 | b5 >> 2), 255 };
+    return c;
+}
+#endif
+
+typedef struct {
+    int shade, tex, zbuf;          /* which attributes the primitive has */
+    int tile;
+    int texrect;                   /* s,t already in s10.5 */
+    unsigned dz;                   /* MRDP_N64: the primitive's depth step (a decal's tolerance; the coverage's dz) */
+    int32_t dzdy;                  /* MRDP_CVG: the triangle's DzDy (the Z offset to the first covered sample) */
+    int fillq;                     /* a fill rectangle (fill mode): the hidden bits by 4-pixel quads */
+} prim_t;
+
+/* attribute order in the iterators */
+enum { AR, AG, AB, AA, AS, AT, AW, AZ, NATTR };
+
+#ifdef MRDP_CVG
+/* ---- the N64's pixel (MRDP_CVG, mrdp.h) ----------------------------------- */
+
+/* the blender's reciprocals, ~2^17 / k (the blender's multiplier table; the N64's own
+ * divider is lossier), k = A5 / 4 + B5 / 4 + 1 */
+static const uint32_t s_bl_recip[16] = { 0x3ffff, 0x20001, 0x10001, 0x0aaab, 0x08001, 0x06667, 0x05556, 0x04925,
+                                         0x04001, 0x038e4, 0x03334, 0x02e8c, 0x02aab, 0x02763, 0x02493, 0x02223 };
+
+/* the highest set bit's place (0 for 0 and 1): the N64's dz encoding */
+static inline unsigned hibit(unsigned v) { unsigned e = 0; while (v > 1) { v >>= 1; e++; } return e; }
+
+/* one blender cycle. P * A5 + M * (B5 + 1) a channel: A5 is the A alpha's
+ * top five bits (B = memory alpha, the coverage: {a[7:5] >> sh_a, 00} and
+ * {cvg >> sh_b, 11}), B5 the B's. blend_en off (or P's own alpha with 1 - a
+ * at 255): P. CLR_ON_CVG without overflow: M. Then >> 5 (the hardware wraps
+ * at 8 bits), or -- a blend without FORCE_BL on the last cycle -- divided by
+ * A5 / 4 + B5 / 4 + 1 through the reciprocal table on bits [13:2] of the sum,
+ * the product's [24:17]. */
+static mrdp_rgba_t blend_n64(const mrdp_t *r, int cyc, mrdp_rgba_t pix, mrdp_rgba_t mem,
+                             unsigned pix_a, unsigned shade_a, unsigned memcvg, unsigned sh_a, unsigned sh_b,
+                             int blend_en, int overflow, int divide, int first)
+{
+    uint32_t l = r->other_l;
+    unsigned p = (l >> (cyc ? 28 : 30)) & 3, a = (l >> (cyc ? 24 : 26)) & 3;
+    unsigned m = (l >> (cyc ? 20 : 22)) & 3, b = (l >> (cyc ? 16 : 18)) & 3;
+    unsigned A = a == 0 ? pix_a : a == 1 ? r->fog.a : a == 2 ? shade_a : 0;
+    unsigned B = b == 0 ? 255u - A : b == 1 ? (memcvg << 5) : b == 2 ? 255u : 0;
+    unsigned A5 = (b == 1) ? (((A >> 5) >> sh_a) << 2) : (A >> 3);
+    unsigned B5 = (b == 1) ? ((((B >> 5) >> sh_b) << 2) | 3u) : (B >> 3);
+    unsigned dv = (A5 >> 2) + (B5 >> 2) + 1;
+    int blend = blend_en && (first || !(a == 0 && b == 0 && A == 255));   /* (2-cycle's first cycle: always) */
+    mrdp_rgba_t P = bl_pm(r, p, pix, mem), M = bl_pm(r, m, pix, mem), o;
+    const uint8_t *pp = &P.r, *pm = &M.r;
+    uint8_t *po = &o.r;
+    for (int ch = 0; ch < 3; ch++) {
+        unsigned sum = (unsigned)pp[ch] * A5 + (unsigned)pm[ch] * (B5 + 1);          /* < 2^14 */
+        if ((l & MRDP_L_CLR_ON_CVG) && !overflow) po[ch] = pm[ch];                   /* (Angrylion: M itself) */
+        else if (!blend) po[ch] = pp[ch];
+        else if (divide) po[ch] = (uint8_t)((((sum >> 2) & 0xFFFu) * s_bl_recip[dv]) >> 17);
+        else po[ch] = (uint8_t)(sum >> 5);
+    }
+    o.a = pix.a;
+    return o;
+}
+
+/* The hidden plane (mrdp.h, MRDP_HID_BASE): the N64's other two coverage bits
+ * of each 16-bit word of RDRAM, 16 of them a 32-bit word (bits [2k+1:2k] for
+ * the word at byte 2k of a 32-byte group), through the 16-bit accessors */
+static inline uint32_t hid_addr(uint32_t a) { return MRDP_HID_BASE + (((a & 0x7FFFFFu) >> 5) << 2); }
+static inline unsigned hid_get(mrdp_t *r, uint32_t a)
+{
+    unsigned k = (a >> 1) & 15u;
+    uint16_t h = r->rd16(r->ctx, hid_addr(a) + (k < 8u ? 2u : 0u));
+    return (h >> (2u * (k & 7u))) & 3u;
+}
+static inline void hid_set(mrdp_t *r, uint32_t a, unsigned v)
+{
+    unsigned k = (a >> 1) & 15u;
+    uint32_t ha = hid_addr(a) + (k < 8u ? 2u : 0u);
+    uint16_t h = r->rd16(r->ctx, ha);
+    h = (uint16_t)((h & ~(3u << (2u * (k & 7u)))) | ((v & 3u) << (2u * (k & 7u))));
+    r->wr16(r->ctx, ha, h);
+}
+
+/* The colour image's word for the pixel: RGBA5551, bit 0 the coverage's top
+ * bit */
+static inline uint16_t rgb5551(mrdp_rgba_t c, int complete)
+{
+    return (uint16_t)(((c.r >> 3) << 11) | ((c.g >> 3) << 6) | ((c.b >> 3) << 1) | (complete ? 1u : 0u));
+}
+
+/* does the pixel pipeline read the colour image (rtl/rdp/rdp_top.v need_mem):
+ * for the memory coverage (IM_RD, with AA_EN or CVG_X_ALPHA), or for a
+ * blender cycle that selects it */
+static int cvg_need_mem(uint32_t l, unsigned cyc)
+{
+    if (cyc == 2) return 0;
+    if ((l & MRDP_L_IM_RD) && (l & (MRDP_L_AA_EN | MRDP_L_CVG_X_ALPHA))) return 1;
+    int need = cyc == 1 ? (bl_reads_memory(l, 0) || bl_reads_memory(l, 1)) : bl_reads_memory(l, 0);
+    if (!(l & MRDP_L_FORCE_BL)) {
+        unsigned p = (l >> (cyc == 1 ? 28 : 30)) & 3;
+        need = p == 1 || (cyc == 1 && p == 0 && bl_reads_memory(l, 0));
+    }
+    return need;
+}
+
+/* the N64's pixel: mask is its 8 samples (bit 7 the top-left; 0xFF for a
+ * rectangle or a triangle without AA_EN) */
+static void draw_pixel_cvg(mrdp_t *r, const prim_t *pr, int x, int y, const int32_t *at, unsigned mask)
+{
+    uint32_t h = r->other_h, l = r->other_l;
+    unsigned cyc = (h >> MRDP_H_CYCLE_SHIFT) & 3;
+    uint32_t pix_off = ((uint32_t)y * r->cimg_width + (uint32_t)x) * 2;
+    uint32_t caddr = r->cimg + pix_off, zaddr = r->zimg + pix_off;
+    const int aa = (l & MRDP_L_AA_EN) != 0;
+    unsigned cvg = (unsigned)__builtin_popcount(mask & 0xFFu);                  /* 0..8 */
+    /* the noise (the RTL's LFSR: a step for each pixel with coverage) */
+    const uint32_t rnd = r->lfsr;
+    if (cvg) r->lfsr = ((rnd << 1) | (~((rnd >> 22) ^ (rnd >> 18)) & 1u)) & 0x7FFFFFu;
+
+    /* depth */
+    uint16_t depth;
+    if ((l & MRDP_L_Z_SRC_PRIM) || !pr->zbuf) {
+        depth = r->prim_z;
+    } else {
+        int32_t z = at[AZ] >> 15;
+        depth = (uint16_t)(z < 0 ? 0 : z > 0xFFFF ? 0xFFFF : z);
+    }
+
+    /* inputs */
+    cc_in_t in;
+    memset(&in, 0, sizeof in);
+    mrdp_rgba_t tex_next = { 0, 0, 0, 0 };   /* the next tile's sample (TEXEL1 of the first cycle) */
+    int have_next = 0;
+    if (pr->shade) {
+        /* saturated to 9 bits, 0..511 (the combiner's; mrdp.c cc_eval) */
+        in.sh9[0] = clamp9(at[AR] >> 16);
+        in.sh9[1] = clamp9(at[AG] >> 16);
+        in.sh9[2] = clamp9(at[AB] >> 16);
+        in.sh9[3] = clamp9(at[AA] >> 16);
+    }
+    {
+        /* A primitive without texture coefficients (a triangle whose command has no S, T, W block; a fill rectangle)
+         * has S = T = W = 0, and the texture stages run all the same: TEXEL0 is the tile's texel at (0, 0) -- what
+         * the last texture bound there left (the hardware's command unit starts every primitive with S, T, W at 0
+         * and its pixel pipeline never skips the fetch). A combiner that reads TEXEL0 on such a triangle is
+         * not a mistake of the game's: Link's tunic collar (object_link_child, gLinkChildCollarNearDL: G_TEXTURE off,
+         * combiner TEXEL0 * SHADE, then ENV * COMBINED) is drawn that way, and with TEXEL0 = 0 it was black. */
+        int32_t s = 0, t = 0;
+        if (!pr->tex) { }
+        else if (pr->texrect) { s = (int16_t)at[AS]; t = (int16_t)at[AT]; }
+        else if (h & MRDP_H_PERSP) { s = mrdp_persp(at[AS] >> 4, (uint32_t)at[AW]); t = mrdp_persp(at[AT] >> 4, (uint32_t)at[AW]); }
+        else { s = s105_noperp(at[AS] >> 5); t = s105_noperp(at[AT] >> 5); }
+        in.tex = texture_sample(r, pr->tile, s, t);
+        /* TEXEL1 in the first cycle of a 2-cycle pixel: the next tile (tile + 1) at the same S, T -- the N64's
+         * second texture (a skybox's day / night blend, a terrain's second layer). Its second cycle still
+         * takes TEXEL0 for both: one fetch more per pixel is all rtl/rdp has. (Without texture coefficients:
+         * TEXEL0 again, one pass.) */
+        in.tex1 = in.tex;
+        if (pr->tex && cyc == 1 && (cc0_uses_texel1(r) || cc1_uses_texel0(r))) {
+            tex_next = texture_sample(r, (pr->tile + 1) & 7, s, t);
+            if (cc0_uses_texel1(r)) in.tex1 = tex_next;
+            have_next = 1;
+        }
+    }
+
+    /* combiner (the alphas as cc_alpha_res: 0..256, ar for the coverage; the first cycle's, ar0, for the alpha compare) */
+    mrdp_rgba_t comb;
+    unsigned ar = 0, ar0 = 0;
+    if (cyc == 2) {
+        comb = in.tex;
+        ar = comb.a;
+    } else {
+        if (cyc == 1) {
+            cc_out_t c0 = combine_raw(r, &in, 0);
+            for (int i = 0; i < 4; i++) in.cm9[i] = c0.v[i];
+            ar0 = (unsigned)cc_alpha_res(c0.v[3]);
+            /* the second cycle: TEXEL0 is the first cycle's TEXEL1 (the next tile's sample), TEXEL1 the tile's (the N64's is
+             * the next pixel's tile sample: not kept). A pixel without texture coefficients keeps TEXEL0 as it is. */
+            in.tex1 = in.tex;
+            if (have_next) in.tex = tex_next;
+        }
+        cc_out_t c1 = combine_raw(r, &in, 1);
+        comb.r = (uint8_t)cc_color_res(c1.v[0]); comb.g = (uint8_t)cc_color_res(c1.v[1]); comb.b = (uint8_t)cc_color_res(c1.v[2]);
+        ar = (unsigned)cc_alpha_res(c1.v[3]);
+        comb.a = (uint8_t)(ar > 255u ? 255u : ar);
+    }
+
+    /* alpha and coverage: CVG_X_ALPHA scales the coverage by the alpha,
+     * ALPHA_CVG_SEL makes the alpha the coverage; else the alpha dither.
+     * (2-cycle: the alpha compare takes the first cycle's alpha, through the
+     * same steps.) */
+    const unsigned adith = cyc == 2 ? 0u : dither_a(r, x, y, rnd);                  /* (copy: the texel's alpha as it is) */
+    unsigned cvgmul = ar * cvg + 4u;                                           /* 12 bits (an alpha of 255 counts 256) */
+    unsigned cvg_sel = (l & MRDP_L_CVG_X_ALPHA) ? (cvgmul >> 8) : cvg;
+    unsigned pa, ca;
+    if (!(l & MRDP_L_ALPHA_CVG_SEL)) pa = ar + adith;
+    else pa = (l & MRDP_L_CVG_X_ALPHA) ? (cvgmul >> 3) : (cvg << 5);
+    if (pa > 255) pa = 255;
+    ca = pa;
+    if (cyc == 1) {
+        unsigned m0 = ar0 * cvg + 4u;
+        if (!(l & MRDP_L_ALPHA_CVG_SEL)) ca = ar0 + adith;
+        else ca = (l & MRDP_L_CVG_X_ALPHA) ? (m0 >> 3) : (cvg << 5);
+        if (ca > 255) ca = 255;
+    }
+    unsigned shade_a = (unsigned)in.sh9[3] + adith;           /* (the blender's: 255 from 256 up) */
+    if (shade_a > 255) shade_a = 255;
+
+    /* alpha compare (DITHER_ALPHA_EN: against a random 8-bit number, the LFSR's [7:0]) */
+    /* (copy mode: the texel's alpha bit, not the blend colour; no depth either) */
+    const int copy = cyc == 2;
+    if (l & MRDP_L_ALPHA_CMP) {
+        unsigned thr = copy ? 128u : (l & MRDP_L_ALPHA_DITHER) ? (rnd & 0xFFu) : r->blend.a;
+        if (ca < thr) return;
+    }
+
+    /* memory: the colour and its coverage */
+    mrdp_rgba_t mem = { 0, 0, 0, 255 };
+    unsigned memcvg = 7;
+    const int rd_mem = cvg_need_mem(l, cyc);
+    if (rd_mem) {
+        uint16_t mw = r->rd16(r->ctx, caddr);
+        mem = unrgb565(mw);
+        if (l & MRDP_L_IM_RD) memcvg = (mw & 1u) << 2 | hid_get(r, caddr);                       /* bit 0 and the hidden two */
+    }
+    const int overflow = (memcvg + cvg_sel) >= 8u;
+
+    /* depth compare; the blend enable */
+    int zpass = 1, blend_en;
+    unsigned sh_a = 0, sh_b = 0;
+    if ((l & MRDP_L_Z_CMP) && !copy) {
+        uint16_t old = r->rd16(r->ctx, zaddr);
+        unsigned zmode = (l >> MRDP_L_ZMODE_SHIFT) & 3;
+        unsigned dz = pr->zbuf ? pr->dz : 1u;
+        int max = old == 0xFFFF, infront = depth < old;
+        int nearer = (int)depth - (int)dz <= (int)old;
+        int farther = (int)depth + (int)dz >= (int)old;
+        blend_en = (l & MRDP_L_FORCE_BL) || (!overflow && aa && farther);
+        if (zmode == 1 && infront && farther && overflow) {
+            /* interpenetrating: the coverage scaled by how far it is in front, in dz */
+            unsigned sft = hibit(dz) + 1;
+            unsigned coeff = ((old >> sft) - (depth >> sft)) & 0xFu;
+            cvg_sel = ((cvg_sel * coeff) >> 3) & 0xFu;
+        } else if (zmode == 2) {
+            zpass = infront || max;
+        } else if (zmode == 3) {
+            zpass = farther && nearer && !max;
+        } else {
+            zpass = overflow ? (infront || max) : (nearer || max);
+        }
+    } else {
+        blend_en = (l & MRDP_L_FORCE_BL) || (!overflow && aa);
+        /* without a depth compare the memory coverage's weight is shifted by
+         * the primitive's dz (the N64's dzpixenc, 18-bit units: ours + 2) */
+        unsigned dzenc = (l & MRDP_L_Z_SRC_PRIM) ? hibit(r->prim_dz) : (pr->zbuf ? hibit(pr->dz) + 3u : 0u);
+        if (dzenc > 15u) dzenc = 15u;                                            /* (4 bits) */
+        sh_b = dzenc >= 12u ? 15u - dzenc : 4u;
+    }
+    if (!zpass) return;
+    /* drawn when a sample is covered (AA_EN); without, MRDP's rule keeps
+     * CVG_X_ALPHA's cut-outs out (the N64 would draw them as memory) */
+    if (cvg_sel == 0 && !copy && (aa || (l & MRDP_L_CVG_X_ALPHA))) return;
+
+    /* blender */
+    mrdp_rgba_t out;
+    const int divide = !(l & MRDP_L_FORCE_BL);
+    if (cyc == 2) {
+        out = comb;
+    } else if (cyc == 1) {
+        mrdp_rgba_t b0 = blend_n64(r, 0, comb, mem, pa, shade_a, memcvg, sh_a, sh_b, 1, 1, 0, 1);
+        out = blend_n64(r, 1, b0, mem, pa, shade_a, memcvg, sh_a, sh_b, blend_en, overflow, divide, 0);
+    } else {
+        out = blend_n64(r, 0, comb, mem, pa, shade_a, memcvg, sh_a, sh_b, blend_en, overflow, divide, 0);
+    }
+
+    /* the coverage written (CVG_DST) */
+    unsigned sum = cvg_sel + memcvg, cvg_out;
+    switch ((l >> MRDP_L_CVG_DST_SHIFT) & 3) {
+    case 0:  cvg_out = blend_en ? (sum >= 8u ? 7u : sum) : ((cvg_sel - 1u) & 7u); break;
+    case 1:  cvg_out = sum & 7u; break;
+    case 2:  cvg_out = 7u; break;
+    default: cvg_out = memcvg; break;
+    }
+    if (cyc == 2) cvg_out = comb.a >= 128 ? 7u : 0u;                  /* copy: the texel's alpha bit */
+    int complete = (int)(cvg_out >> 2);
+
+#ifdef MRDP_DEBUG_PIXEL
+    if (x == r->dbg_x && y == r->dbg_y) {
+        fprintf(stderr, "MRDP pixel (%d,%d) <- %04x depth %04x cvg %u mem %u blend %d op %02x words:", x, y, rgb5551(out, complete), depth, cvg_sel, memcvg, blend_en, (r->cmd[0] >> 24) & 0x3F);
+        for (int i = 0; i < r->ncmd; i++) fprintf(stderr, " %08x", r->cmd[i]);
+        fprintf(stderr, "\n  at: r %08x g %08x b %08x a %08x s %08x t %08x w %08x z %08x\n",
+                at[AR], at[AG], at[AB], at[AA], at[AS], at[AT], at[AW], at[AZ]);
+    }
+#endif
+    if (cyc != 2) out = dither_n64(r, out, x, y, rnd, 1);
+    r->wr16(r->ctx, caddr, rgb5551(out, complete));
+    hid_set(r, caddr, cvg_out);
+    if ((l & MRDP_L_Z_UPD) && !copy) r->wr16(r->ctx, zaddr, depth);
+    r->pixels_drawn++;
+}
+#endif /* MRDP_CVG */
+
+static void draw_pixel(mrdp_t *r, const prim_t *pr, int x, int y, const int32_t *at, unsigned mask)
+{
+    uint32_t h = r->other_h, l = r->other_l;
+    unsigned cyc = (h >> MRDP_H_CYCLE_SHIFT) & 3;
+    uint32_t pix_off = ((uint32_t)y * r->cimg_width + (uint32_t)x) * 2;
+    uint32_t caddr = r->cimg + pix_off, zaddr = r->zimg + pix_off;
+
+    if (cyc == 3) {                                /* fill mode */
+        r->wr16(r->ctx, caddr, (x & 1) ? (uint16_t)r->fill : (uint16_t)(r->fill >> 16));
+#ifdef MRDP_CVG
+        /* the hidden bits: each pixel's {a, a}, a its colour's bit 0 -- a fill
+         * rectangle's for every 4-pixel quad it touches (as the N64 writes its
+         * 64-bit words), a triangle's for its pixels */
+        if (pr->fillq) {
+            uint32_t q = caddr & ~7u;
+            for (unsigned i = 0; i < 4; i++)
+                hid_set(r, q + 2u * i, ((r->fill >> ((i & 1u) ? 0 : 16)) & 1u) ? 3u : 0u);
+        } else
+            hid_set(r, caddr, ((x & 1) ? r->fill : r->fill >> 16) & 1u ? 3u : 0u);
+#endif
+        r->pixels_drawn++;
+        return;
+    }
+#ifdef MRDP_CVG
+    draw_pixel_cvg(r, pr, x, y, at, mask);
+    return;
+#else
+    (void)mask;
+#endif
+
+    /* depth */
+    uint16_t depth;
+    if ((l & MRDP_L_Z_SRC_PRIM) || !pr->zbuf) {
+        depth = r->prim_z;
+    } else {
+        int32_t z = at[AZ] >> 15;
+        depth = (uint16_t)(z < 0 ? 0 : z > 0xFFFF ? 0xFFFF : z);
+    }
+    if (l & MRDP_L_Z_CMP) {
+        uint16_t old = r->rd16(r->ctx, zaddr);
+        unsigned zmode = (l >> MRDP_L_ZMODE_SHIFT) & 3;
+        int pass = zmode == 3 ? depth <= old : depth < old;
+#ifdef MRDP_N64
+        /* A decal lies on the surface it marks: it is drawn where the depth
+         * there is within the primitive's own step of it (the N64's rule, on
+         * its dz). As "not behind" alone, a shadow came and went with the
+         * rounding between its plane's depth and the floor's -- and drew
+         * over whatever was beyond the floor's edge. */
+        if (zmode == 3) {
+            int tol = pr->zbuf ? (int)pr->dz : 1;
+            int lo = (int)depth - tol, hi = (int)depth + tol;
+            if (lo < 0) lo = 0;
+            if (hi > 0xFFFF) hi = 0xFFFF;
+            pass = (int)old >= lo && (int)old <= hi;
+        }
+#endif
+        if (!pass) return;
+    }
+
+    /* inputs */
+    cc_in_t in;
+    memset(&in, 0, sizeof in);
+    if (pr->shade) {
+        in.shade.r = (uint8_t)clamp8(at[AR] >> 16);
+        in.shade.g = (uint8_t)clamp8(at[AG] >> 16);
+        in.shade.b = (uint8_t)clamp8(at[AB] >> 16);
+        in.shade.a = (uint8_t)clamp8(at[AA] >> 16);
+    }
+#ifndef MRDP_N64
+    if (pr->tex)                                   /* (MRDP's own primitives: no texture, no texel) */
+#endif
+    {
+        int32_t s = 0, t = 0;                      /* (the N64's, without texture coefficients: S = T = 0, the tile's texel (0, 0); see draw_pixel_cvg) */
+        if (!pr->tex) { }
+        else if (pr->texrect) { s = (int16_t)at[AS]; t = (int16_t)at[AT]; }   /* s10.5: wraps at 16 bits */
+#ifdef MRDP_N64
+        /* the N64's units: S and T are s10.5 in their integer half, W is s.15
+         * (S / W is S * 2^15 / W): through the same reciprocal, 4 bits down */
+        else if (h & MRDP_H_PERSP) { s = mrdp_persp(at[AS] >> 4, (uint32_t)at[AW]); t = mrdp_persp(at[AT] >> 4, (uint32_t)at[AW]); }
+        else { s = s105_noperp(at[AS] >> 5); t = s105_noperp(at[AT] >> 5); }
+#else
+        else if (h & MRDP_H_PERSP) { s = mrdp_persp(at[AS], (uint32_t)at[AW]); t = mrdp_persp(at[AT], (uint32_t)at[AW]); }
+        else { s = s105_noperp(at[AS]); t = s105_noperp(at[AT]); }
+#endif
+        in.tex = texture_sample(r, pr->tile, s, t);
+        in.tex1 = in.tex;
+    }
+
+    /* combiner */
+    mrdp_rgba_t comb;
+    if (cyc == 2) {                                /* copy: the texel itself */
+        comb = in.tex;
+    } else if (cyc == 1) {
+        in.combined = combine(r, &in, 0);
+        comb = combine(r, &in, 1);
+    } else {
+        comb = combine(r, &in, 1);
+    }
+
+    /* alpha compare / coverage from alpha */
+    if ((l & MRDP_L_ALPHA_CMP) && comb.a < r->blend.a) return;
+    if ((l & MRDP_L_CVG_X_ALPHA) && comb.a < MRDP_CVG_ALPHA_MIN) return;
+
+    /* blender */
+    mrdp_rgba_t mem = { 0, 0, 0, 255 };
+    int need_mem = cyc == 1 ? (bl_reads_memory(l, 0) || bl_reads_memory(l, 1)) : bl_reads_memory(l, 0);
+#ifdef MRDP_N64
+    /* (without FORCE_BL the pixel is the last cycle's P alone: memory is read
+     * only if that is memory, or the first cycle's blend of it) */
+    if (!(l & MRDP_L_FORCE_BL)) {
+        unsigned p = (l >> (cyc == 1 ? 28 : 30)) & 3;
+        need_mem = p == 1 || (cyc == 1 && p == 0 && bl_reads_memory(l, 0));
+    }
+#endif
+#ifdef MRDP_NO_BLEND
+    need_mem = 0;
+#endif
+    if (need_mem && cyc != 2) mem = unrgb565(r->rd16(r->ctx, caddr));
+    mrdp_rgba_t out;
+#ifdef MRDP_NO_BLEND
+    /* No blender. A surface blended with what is behind it (FORCE_BL, and
+     * the last cycle's blender reading the colour image) is drawn through a
+     * screen door instead: of every 4 x 4 pixels, as many as its alpha is of
+     * 16 (a fade's black quad, a logo's soft edge, a shadow -- drawn opaque
+     * they would cover what they only tint). */
+    if ((l & MRDP_L_FORCE_BL) && cyc < 2 && bl_reads_memory(l, cyc == 1)) {
+        static const uint8_t door[4][4] = { { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 } };
+        unsigned sel = (l >> (cyc == 1 ? 24 : 26)) & 3;
+        unsigned a = sel == 0 ? comb.a : sel == 1 ? r->fog.a : sel == 2 ? in.shade.a : 0;
+        if (a < door[y & 3][x & 3] * 16u + 8u) return;
+    }
+    if (1) {
+        out = comb;
+#else
+    if (cyc == 2) {
+        out = comb;
+#endif
+    } else if (cyc == 1) {
+        mrdp_rgba_t b0 = blend(r, 0, comb, mem, comb.a, in.shade.a);
+        out = (l & MRDP_L_FORCE_BL) ? blend(r, 1, b0, mem, comb.a, in.shade.a)
+                                    : bl_pm(r, (l >> 28) & 3, b0, mem);
+    } else {
+        out = (l & MRDP_L_FORCE_BL) ? blend(r, 0, comb, mem, comb.a, in.shade.a)
+                                    : bl_pm(r, (l >> 30) & 3, comb, mem);
+    }
+
+#ifdef MRDP_DEBUG_PIXEL
+    if (x == r->dbg_x && y == r->dbg_y) {
+        fprintf(stderr, "MRDP pixel (%d,%d) <- %04x depth %04x op %02x words:", x, y, rgb565(out), depth, (r->cmd[0] >> 24) & 0x3F);
+        for (int i = 0; i < r->ncmd; i++) fprintf(stderr, " %08x", r->cmd[i]);
+        fprintf(stderr, "\n  at: r %08x g %08x b %08x a %08x s %08x t %08x w %08x z %08x\n",
+                at[AR], at[AG], at[AB], at[AA], at[AS], at[AT], at[AW], at[AZ]);
+    }
+#endif
+#ifdef MRDP_N64
+    if (cyc != 2) out = dither_n64(r, out, x, y, 0, 0);
+#endif
+    r->wr16(r->ctx, caddr, rgb565(out));
+    if (l & MRDP_L_Z_UPD) r->wr16(r->ctx, zaddr, depth);
+    r->pixels_drawn++;
+}
+
+static inline int sc_x0(const mrdp_t *r) { return r->sc_xh >> 2; }
+static inline int sc_x1(const mrdp_t *r) { return r->sc_xl >> 2; }
+static inline int sc_y0(const mrdp_t *r) { return r->sc_yh >> 2; }
+static inline int sc_y1(const mrdp_t *r) { return r->sc_yl >> 2; }
+
+/* ---- triangle ------------------------------------------------------------ */
+
+/* attribute: value, per-pixel and per-scanline (along the H edge) slopes */
+typedef struct { int32_t v, dx, de; } attr_t;
+
+static void tri_attrs(const uint32_t *w, attr_t *a, int base, int n)
+{
+    /* N64 layout: w[0] ints (A,B,C,D), w[2] ints of DxDx, w[4] fracs,
+     * w[6] fracs of DxDx, w[8] ints of DxDe, w[10] ints of DxDy,
+     * w[12] fracs of DxDe, w[14] fracs of DxDy -- 64-bit words as pairs */
+    for (int k = 0; k < n; k++) {
+        int wi = k >> 1, sh = (k & 1) ? 0 : 16;
+        uint32_t vi = (w[0 + wi] >> sh) & 0xFFFF, vf = (w[4 + wi] >> sh) & 0xFFFF;
+        uint32_t xi = (w[2 + wi] >> sh) & 0xFFFF, xf = (w[6 + wi] >> sh) & 0xFFFF;
+        uint32_t ei = (w[8 + wi] >> sh) & 0xFFFF, ef = (w[12 + wi] >> sh) & 0xFFFF;
+        a[base + k].v = (int32_t)(vi << 16 | vf);
+        a[base + k].dx = (int32_t)(xi << 16 | xf);
+        a[base + k].de = (int32_t)(ei << 16 | ef);
+    }
+}
+
+#ifdef MRDP_CVG
+/* AA_EN: the N64's walker (mrdp.h). The edges start at XH & ~1, XM & ~1 at the
+ * top of the first row (XL at YM, taken back to its row's top) and step
+ * (DxDy >> 2) & ~1 a subscanline -- four a row -- in eighths with a sticky
+ * bit, clamped to the scissor; a subscanline is valid between YH and YL and
+ * the scissor's quarter rows, with its right end not before its left. A
+ * pixel's samples: two a subscanline in a checkerboard (0xA on even ones, 0x5
+ * on odd, bit 3 the leftmost quarter); the N64's byte has subscanlines 0 and
+ * 1 in its high nibble. Attributes are the row's at the pixel centre (MRDP's
+ * exh, as the other path); Z is moved to the first covered sample -- the
+ * lowest subscanline, its leftmost sample -- in eighths from the centre. */
+static void draw_triangle_aa(mrdp_t *r, const prim_t *pr, int aa_en, int lft, int32_t yh, int32_t ym, int32_t yl,
+                             int32_t xh, int32_t dxh, int32_t xm, int32_t dxm, int32_t xl, int32_t dxl,
+                             const attr_t *at)
+{
+    int y0 = yh >> 2, ymr = ym >> 2;
+    int ya = y0 > sc_y0(r) ? y0 : sc_y0(r);
+    int yb = (yl + 3) >> 2;
+    if (yb > sc_y1(r)) yb = sc_y1(r);
+    const uint32_t qh = (uint32_t)(dxh >> 2) & ~1u, qm = (uint32_t)(dxm >> 2) & ~1u, ql = (uint32_t)(dxl >> 2) & ~1u;
+    uint32_t axh = ((uint32_t)xh & ~1u) + (uint32_t)(ya - y0) * (qh << 2);
+    uint32_t axm = ((uint32_t)xm & ~1u) + (uint32_t)(ya - y0) * (qm << 2);
+    uint32_t axl = ((uint32_t)xl & ~1u) - (uint32_t)(ym & 3) * ql + (uint32_t)(ya - ymr) * (ql << 2);
+    const int32_t cxh = (int32_t)r->sc_xh << 1, cxl = (int32_t)r->sc_xl << 1;   /* the scissor in eighths */
+    const int32_t yhl = yh > (int32_t)r->sc_yh ? yh : (int32_t)r->sc_yh;        /* and in quarter rows */
+    const int32_t yll = yl < (int32_t)r->sc_yl ? yl : (int32_t)r->sc_yl;
+    for (int y = ya; y < yb; y++) {
+        uint32_t k = (uint32_t)(y - y0);
+        int32_t exh = (int32_t)((uint32_t)xh + k * (uint32_t)dxh);   /* the row's top: attributes (the N64's, not the pixel centre) */
+        int lp[4], rp[4], lf[4], rf[4], valid[4], any = 0;
+        int xmin = 0, xmax = 0;
+        for (int j = 0; j < 4; j++) {
+            int yq = 4 * y + j;
+            uint32_t xa = axh + (uint32_t)j * qh;
+            uint32_t xb = (yq < ym) ? axm + (uint32_t)j * qm : axl + (uint32_t)j * ql;
+            int32_t lx = (int32_t)(lft ? xa : xb), rx = (int32_t)(lft ? xb : xa);
+            int crossed = (rx >> 14) < (lx >> 14);
+            int32_t l8 = (int32_t)(((uint32_t)(lx >> 14) << 1) | ((lx & 0x3FFE) != 0));   /* eighths, sticky */
+            int32_t r8 = (int32_t)(((uint32_t)(rx >> 14) << 1) | ((rx & 0x3FFE) != 0));
+            if (l8 < cxh) l8 = cxh;
+            if (l8 > cxl) l8 = cxl;
+            if (r8 < cxh) r8 = cxh;
+            if (r8 > cxl) r8 = cxl;
+            lp[j] = l8 >> 3; lf[j] = l8 & 7; rp[j] = r8 >> 3; rf[j] = r8 & 7;
+            valid[j] = yq >= yhl && yq < yll && !crossed;
+            if (valid[j]) {
+                if (!any || lp[j] < xmin) xmin = lp[j];
+                if (!any || rp[j] > xmax) xmax = rp[j];
+                any = 1;
+            }
+        }
+        axh += qh << 2; axm += qm << 2; axl += ql << 2;
+#ifdef MRDP_DEBUG_AA
+        if (any) {
+            int v = 0; for (int j = 0; j < 4; j++) v |= valid[j] << j;
+            fprintf(stderr, "AAROW y=%d v=%x", y, v);
+            for (int j = 3; j >= 0; j--) fprintf(stderr, " %d:%d:%d:%d", lp[j] & 0xFFFF, lf[j], rp[j] & 0xFFFF, rf[j]);
+            fprintf(stderr, " min=%d max=%d\n", xmin, xmax);
+        }
+#endif
+        if (!any) continue;
+        if (xmax > sc_x1(r) - 1) xmax = sc_x1(r) - 1;      /* (the pixel at the scissor's end never has a sample) */
+        if (xmin > xmax) continue;
+        int32_t dx0 = (int32_t)((uint32_t)xmin << 16) - exh;
+        int32_t cur[NATTR];
+        for (int i = 0; i < NATTR; i++) {
+            uint32_t e = (uint32_t)at[i].v + k * (uint32_t)at[i].de;
+            cur[i] = (int32_t)(e + (uint32_t)(int32_t)(((int64_t)at[i].dx * dx0) >> 16));
+        }
+        for (int x = xmin; x <= xmax; x++) {
+            if (x > xmin)
+                for (int i = 0; i < NATTR; i++) cur[i] = (int32_t)((uint32_t)cur[i] + (uint32_t)at[i].dx);
+            unsigned cj[4];
+            for (int j = 0; j < 4; j++) {
+                unsigned fm = (j & 1) ? 0x5u : 0xAu;
+                unsigned lm = (0xFu >> ((lf[j] + 1) >> 1)) & fm;
+                unsigned rm = ((0xF0u >> ((rf[j] + 1) >> 1)) & 0xFu) & fm;
+                cj[j] = 0;
+                if (!valid[j]) continue;
+                if (x > lp[j] && x < rp[j]) cj[j] = fm;
+                else if (x == lp[j] && x == rp[j]) cj[j] = lm & rm;
+                else if (rp[j] > lp[j] && x == lp[j]) cj[j] = lm;
+                else if (rp[j] > lp[j] && x == rp[j]) cj[j] = rm;
+            }
+            unsigned mask = ((cj[0] | cj[1]) << 4) | (cj[2] | cj[3]);
+            if (!mask) continue;
+            if (!aa_en && !(mask & 0x80u)) continue;      /* no AA_EN: drawn only if the top-left sample (sample 7) is covered */
+            int32_t pc[NATTR];
+            for (int i = 0; i < NATTR; i++) pc[i] = cur[i];
+            int oy = 0; while (!cj[oy]) oy++;
+            int ox = 0; while (!((cj[oy] >> (3 - ox)) & 1u)) ox++;
+            int32_t sx8 = 2 * ox, sy8 = 2 * oy;      /* the sample, from the pixel's top-left corner, 1/8 px (0 for sample 7) */
+            uint32_t corr = ((uint32_t)((at[AZ].dx >> 5) * sx8) + (uint32_t)((pr->dzdy >> 5) * sy8)) << 2;
+            pc[AZ] = (int32_t)((uint32_t)pc[AZ] + corr);
+#ifdef MRDP_DEBUG_AA
+            fprintf(stderr, "AAPIX x=%d y=%d mask=%02x sx=%d sy=%d z=%08x\n", x, y, mask, sx8, sy8, (uint32_t)pc[AZ]);
+#endif
+            draw_pixel(r, pr, x, y, pc, mask);
+        }
+    }
+}
+#endif /* MRDP_CVG */
+
+static void draw_triangle(mrdp_t *r, const uint32_t *w)
+{
+    unsigned op = (w[0] >> 24) & 0x3F;
+    prim_t pr = { !!(op & 4), !!(op & 2), !!(op & 1), (int)((w[0] >> 16) & 7), 0, 0, 0, 0 };
+    int lft = (w[0] >> 23) & 1;
+    int32_t yl = sext(w[0], 14), ym = sext(w[1] >> 16, 14), yh = sext(w[1], 14);
+    int32_t xl = (int32_t)w[2], dxl = (int32_t)w[3];
+    int32_t xh = (int32_t)w[4], dxh = (int32_t)w[5];
+    int32_t xm = (int32_t)w[6], dxm = (int32_t)w[7];
+
+    attr_t at[NATTR];
+    memset(at, 0, sizeof at);
+    const uint32_t *p = w + 8;
+    if (pr.shade) { tri_attrs(p, at, AR, 4); p += 16; }
+    if (pr.tex) { tri_attrs(p, at, AS, 3); p += 16; }   /* S, T, W (4th unused) */
+    if (pr.zbuf) {
+        at[AZ].v = (int32_t)p[0]; at[AZ].dx = (int32_t)p[1];
+        at[AZ].de = (int32_t)p[2];
+#ifdef MRDP_N64
+        /* the depth a pixel's step moves it, |DzDx| + |DzDy| in the stored
+         * depth's units, up to all ones under its top bit: a decal's tolerance */
+        int32_t zx = (int32_t)p[1], zy = (int32_t)p[3];
+        uint32_t s = (((uint32_t)(zx < 0 ? ~zx : zx) >> 15) & 0x1FFFFu) + (((uint32_t)(zy < 0 ? ~zy : zy) >> 15) & 0x1FFFFu);
+        s |= s >> 1; s |= s >> 2; s |= s >> 4; s |= s >> 8; s |= s >> 16;
+        pr.dz = (s & 0xFFFFu) | 1u;
+        pr.dzdy = zy;
+#endif
+    }
+
+    int y0 = yh >> 2;                 /* the integer scanline of XH / XM / A */
+    int ymr = ym >> 2;                /* the integer scanline of XL */
+#ifdef MRDP_N64
+    /* the N64's XL is the low edge at YM itself (the middle vertex), not at
+     * YM's integer scanline as XH and XM are at YH's: taken back the quarter
+     * rows between them. (As if at the scanline, a shallow low edge was off
+     * by up to 3/4 of its slope: cracks all along it.) */
+#ifdef MRDP_CVG
+    draw_triangle_aa(r, &pr, (r->other_l & MRDP_L_AA_EN) != 0, lft, yh, ym, yl, xh, dxh, xm, dxm, xl, dxl, at);
+    return;
+#endif
+    xl = (int32_t)((uint32_t)xl - (uint32_t)(ym & 3) * (uint32_t)(dxl >> 2));
+#endif
+    int ya = y0 > sc_y0(r) ? y0 : sc_y0(r);
+    int yb = ((yl - 2 + 3) >> 2);     /* rows with 4y+2 < yl: y <= (yl-3)/4 */
+    if (yb > sc_y1(r)) yb = sc_y1(r);
+
+    /* AA_EN without the N64's coverage: the crack grow (mrdp_grow_mask, TRI_R only) */
+    int32_t gh = 0, gm = 0, gl = 0;
+    if (r->other_l & MRDP_L_AA_EN) {
+        if (r->grow & 1u) gh = mrdp_grow_amount(dxh);
+        if (r->grow & 2u) gm = mrdp_grow_amount(dxm);
+        if (r->grow & 4u) gl = mrdp_grow_amount(dxl);
+    }
+    for (int y = ya; y < yb; y++) {
+        if (4 * y + 2 < yh) continue;
+        /* all edge and attribute arithmetic wraps modulo 2^32, as the RTL's
+         * incremental adders do */
+        uint32_t k = (uint32_t)(y - y0);
+        int32_t exh = (int32_t)((uint32_t)xh + (uint32_t)(dxh >> 1) + k * (uint32_t)dxh);
+        int32_t exm = (4 * y + 2 < ym)
+            ? (int32_t)((uint32_t)xm + (uint32_t)(dxm >> 1) + k * (uint32_t)dxm)
+            : (int32_t)((uint32_t)xl + (uint32_t)(dxl >> 1) + (uint32_t)(y - ymr) * (uint32_t)dxl);
+        int32_t xleft = lft ? exh : exm, xright = lft ? exm : exh;
+        int32_t gmin = (4 * y + 2 < ym) ? gm : gl;
+        int32_t gleft = lft ? gh : gmin, gright = lft ? gmin : gh;
+        /* 33 bits, as the RTL (xs_c / xe_c): in 32 an edge wrapped near
+         * +-32768 px overflowed and the model and the RTL disagreed */
+        int64_t xs64 = ((int64_t)xleft + (0x7FFF - gleft)) >> 16, xe64 = ((int64_t)xright + (0x7FFF + gright)) >> 16;
+        if (xs64 < sc_x0(r)) xs64 = sc_x0(r);
+        if (xe64 > sc_x1(r)) xe64 = sc_x1(r);
+        int xs = (int)xs64, xe = (int)xe64;
+        if (xs >= xe) continue;
+
+        /* span start: A + DaDe/2 + k*DaDe on the H edge, then DaDx * (xs + 0.5 - xh) */
+        int32_t dx = (int32_t)(((uint32_t)xs << 16) + 0x8000) - exh;
+        int32_t cur[NATTR];
+        for (int i = 0; i < NATTR; i++) {
+            uint32_t e = (uint32_t)at[i].v + (uint32_t)(at[i].de >> 1) + k * (uint32_t)at[i].de;
+            cur[i] = (int32_t)(e + (uint32_t)(int32_t)(((int64_t)at[i].dx * dx) >> 16));
+        }
+        for (int x = xs; x < xe; x++) {
+            draw_pixel(r, &pr, x, y, cur, 0xFFu);
+            for (int i = 0; i < NATTR; i++) cur[i] = (int32_t)((uint32_t)cur[i] + (uint32_t)at[i].dx);
+        }
+    }
+}
+
+/* ---- rectangles ----------------------------------------------------------- */
+
+static void draw_texrect(mrdp_t *r, const uint32_t *w, int flip)
+{
+    unsigned cyc = (r->other_h >> MRDP_H_CYCLE_SHIFT) & 3;
+    int xl = (w[0] >> 12) & 0xFFF, yl = w[0] & 0xFFF;
+    int xh = (w[1] >> 12) & 0xFFF, yh = w[1] & 0xFFF;
+    prim_t pr = { 0, 1, 0, (int)((w[1] >> 24) & 7), 1, 0, 0, 0 };
+    int32_t s = sext(w[2] >> 16, 16), t = sext(w[2], 16);
+    int32_t dsdx = sext(w[3] >> 16, 16), dtdy = sext(w[3], 16);
+    int x0 = xh >> 2, x1 = (cyc == 2) ? (xl >> 2) + 1 : (xl >> 2);
+    int y0 = yh >> 2, y1 = (cyc == 2) ? (yl >> 2) + 1 : (yl >> 2);
+    int dshift = (cyc == 2) ? 7 : 5;              /* copy mode: DsDx is 4x */
+    int xa = x0 > sc_x0(r) ? x0 : sc_x0(r), xb = x1 < sc_x1(r) ? x1 : sc_x1(r);
+    int ya = y0 > sc_y0(r) ? y0 : sc_y0(r), yb = y1 < sc_y1(r) ? y1 : sc_y1(r);
+    for (int y = ya; y < yb; y++)
+        for (int x = xa; x < xb; x++) {
+            int32_t at[NATTR] = { 0 };
+            int32_t ds = (dsdx * (x - x0)) >> dshift, dt = (dtdy * (y - y0)) >> 5;
+            at[AS] = flip ? s + ((dsdx * (y - y0)) >> dshift) : s + ds;
+            at[AT] = flip ? t + ((dtdy * (x - x0)) >> 5) : t + dt;
+            draw_pixel(r, &pr, x, y, at, 0xFFu);
+        }
+}
+
+static void fill_rect(mrdp_t *r, const uint32_t *w)
+{
+    unsigned cyc = (r->other_h >> MRDP_H_CYCLE_SHIFT) & 3;
+    int xl = (w[0] >> 12) & 0xFFF, yl = w[0] & 0xFFF;
+    int xh = (w[1] >> 12) & 0xFFF, yh = w[1] & 0xFFF;
+    int x0 = xh >> 2, y0 = yh >> 2;
+    int x1 = (cyc == 3) ? (xl >> 2) + 1 : (xl >> 2);
+    int y1 = (cyc == 3) ? (yl >> 2) + 1 : (yl >> 2);
+    prim_t pr = { 0, 0, 0, 0, 0, 0, 0, 1 };
+    int xa = x0 > sc_x0(r) ? x0 : sc_x0(r), xb = x1 < sc_x1(r) ? x1 : sc_x1(r);
+    int ya = y0 > sc_y0(r) ? y0 : sc_y0(r), yb = y1 < sc_y1(r) ? y1 : sc_y1(r);
+    int32_t at[NATTR] = { 0 };
+    for (int y = ya; y < yb; y++)
+        for (int x = xa; x < xb; x++)
+            draw_pixel(r, &pr, x, y, at, 0xFFu);
+}
+
+/* ---- texture loads ---------------------------------------------------------- */
+
+static void set_tile_size(mrdp_t *r, const uint32_t *w)
+{
+    mrdp_tile_t *t = &r->tile[(w[1] >> 24) & 7];
+    t->uls = (w[0] >> 12) & 0xFFF;
+    t->ult = w[0] & 0xFFF;
+    t->lrs = (w[1] >> 12) & 0xFFF;
+    t->lrt = w[1] & 0xFFF;
+}
+
+#ifndef MRDP_N64
+static void load_tile(mrdp_t *r, const uint32_t *w)
+{
+    set_tile_size(r, w);
+    const mrdp_tile_t *t = &r->tile[(w[1] >> 24) & 7];
+    int s0 = t->uls >> 2, t0 = t->ult >> 2, s1 = t->lrs >> 2, t1 = t->lrt >> 2;
+    for (int tt = t0; tt <= t1; tt++)
+        for (int s = s0; s <= s1; s++) {
+            uint16_t v = r->rd16(r->ctx, r->timg + ((uint32_t)tt * r->timg_width + (uint32_t)s) * 2);
+            int bank, addr;
+            tmem_locate(t, s - s0, tt - t0, &bank, &addr);
+            r->tmem[bank][addr] = v;
+        }
+}
+#endif
+
+#ifdef MRDP_N64
+/* The N64's loads: the texture image, as it is in memory, into TMEM, in whole
+ * 64-bit words (a row's last word takes what follows the row in memory, as
+ * the N64's does). The image is read by bytes: a row may start at any.
+ * The halves of an odd row's 64-bit words change places as they are loaded
+ * (tmem_fetch: and again as they are sampled). A row is odd by the load's own
+ * count: LOAD TILE's rows, LOAD BLOCK's dxt summed over its words. */
+static inline uint16_t timg_hw(mrdp_t *r, uint32_t a)
+{
+    uint16_t v0 = r->rd16(r->ctx, a & ~1u);
+    if (!(a & 1u)) return v0;
+    return (uint16_t)(v0 << 8 | r->rd16(r->ctx, (a & ~1u) + 2u) >> 8);
+}
+/* n 32-bit words from src to TMEM's 16-bit word dst (a multiple of 4): one
+ * after the other, or (a 32-bit RGBA tile) each word's halves to the two
+ * halves of TMEM. dxt: LOAD BLOCK's, what a 64-bit word adds to the row count
+ * (u1.11); odd: the row is odd throughout (LOAD TILE's). */
+static void tmem_load(mrdp_t *r, const mrdp_tile_t *t, uint32_t src, uint32_t dst, uint32_t n, uint32_t dxt, int odd)
+{
+    const int split = t->fmt == 0 && t->size == 3;
+    for (uint32_t k = 0; k < n; k++) {
+        uint16_t h0 = timg_hw(r, src + 4u * k), h1 = timg_hw(r, src + 4u * k + 2u);
+        uint32_t j = k >> 1;                         /* (the 64-bit word of the image this is of) */
+        uint32_t sw = (odd || (((j * dxt) >> 11) & 1u)) ? 2u : 0u;
+        if (split) {
+            uint32_t i = ((dst + k) ^ sw) & 0x3FF;
+            r->tmem16[i] = h0; r->tmem16[0x400 | i] = h1;
+        } else {
+            uint32_t i = ((dst + 2u * k) ^ sw) & 0x7FE;
+            r->tmem16[i] = h0; r->tmem16[i | 1u] = h1;
+        }
+    }
+}
+/* the 64-bit words n texels of the image take, as 32-bit ones */
+static inline uint32_t load_words(const mrdp_t *r, uint32_t n)
+{
+    uint32_t bytes = ((n << r->timg_size) + 1u) >> 1;
+    uint32_t w = ((bytes + 7u) >> 3) * 2u;
+    return w > 1024u ? 1024u : w;                    /* TMEM once over */
+}
+static inline uint32_t timg_addr(const mrdp_t *r, uint32_t s, uint32_t t)
+{
+    return r->timg + (((t * r->timg_width + s) << r->timg_size) >> 1);
+}
+/* LOAD BLOCK: texels uls .. lrs of the texture image (a run, not a rectangle), to the tile's TMEM address */
+static void load_block(mrdp_t *r, const uint32_t *w)
+{
+    const mrdp_tile_t *t = &r->tile[(w[1] >> 24) & 7];
+    uint32_t uls = (w[0] >> 12) & 0xFFF, ult = w[0] & 0xFFF, lrs = (w[1] >> 12) & 0xFFF;
+    if (lrs < uls) return;
+    tmem_load(r, t, timg_addr(r, uls, ult), (uint32_t)t->tmem * 4u, load_words(r, lrs - uls + 1u), w[1] & 0xFFFu, 0);
+}
+/* LOAD TLUT: 16-bit entries uls .. lrs of the texture image, each four times over (a 64-bit word of TMEM) */
+static void load_tlut(mrdp_t *r, const uint32_t *w)
+{
+    const mrdp_tile_t *t = &r->tile[(w[1] >> 24) & 7];
+    uint32_t uls = ((w[0] >> 12) & 0xFFF) >> 2, ult = (w[0] & 0xFFF) >> 2, lrs = ((w[1] >> 12) & 0xFFF) >> 2;
+    if (lrs < uls) return;
+    uint32_t n = lrs - uls + 1u, src = r->timg + ((ult * r->timg_width + uls) << 1);
+    if (n > 256u) n = 256u;
+    for (uint32_t e = 0; e < n; e++) {
+        uint16_t v = timg_hw(r, src + 2u * e);
+        for (uint32_t k = 0; k < 4; k++) r->tmem16[((uint32_t)t->tmem * 4u + 4u * e + k) & 0x7FF] = v;
+    }
+}
+/* LOAD TILE: a rectangle of the texture image, row by row at the tile's row length */
+static void load_tile_n64(mrdp_t *r, const uint32_t *w)
+{
+    const mrdp_tile_t *t = &r->tile[(w[1] >> 24) & 7];
+    uint32_t s0 = t->uls >> 2, t0 = t->ult >> 2, s1 = t->lrs >> 2, t1 = t->lrt >> 2;
+    if (s1 < s0 || t1 < t0) return;
+    for (uint32_t tt = t0; tt <= t1; tt++)
+        tmem_load(r, t, timg_addr(r, s0, tt), (uint32_t)t->tmem * 4u + (tt - t0) * (uint32_t)t->line * 4u,
+                  load_words(r, s1 - s0 + 1u), 0, (int)((tt - t0) & 1u));
+}
+#endif
+
+static void set_tile(mrdp_t *r, const uint32_t *w)
+{
+    mrdp_tile_t *t = &r->tile[(w[1] >> 24) & 7];
+    t->fmt = (w[0] >> 21) & 7;
+    t->line = (w[0] >> 9) & 0x1FF;
+#ifdef MRDP_N64
+    t->size = (w[0] >> 19) & 3;
+    t->palette = (w[1] >> 20) & 15;
+    t->tmem = (uint16_t)(w[0] & 0x1FF);
+    t->ct = (w[1] >> 19) & 1; t->mt = (w[1] >> 18) & 1;
+    t->maskt = (w[1] >> 14) & 15; t->shiftt = (w[1] >> 10) & 15;
+    t->cs = (w[1] >> 9) & 1; t->ms = (w[1] >> 8) & 1;
+    t->masks = (w[1] >> 4) & 15; t->shifts = w[1] & 15;
+    return;
+#endif
+    t->tmem = (uint16_t)((w[0] & 0x1FF) | (((w[0] >> 18) & 1) << 9));
+    t->ct = (w[1] >> 19) & 1; t->mt = (w[1] >> 18) & 1;
+    t->maskt = (w[1] >> 14) & 15; t->shiftt = (w[1] >> 10) & 15;
+    t->cs = (w[1] >> 9) & 1; t->ms = (w[1] >> 8) & 1;
+    t->masks = (w[1] >> 4) & 15; t->shifts = w[1] & 15;
+}
+
+/* ---- command dispatch --------------------------------------------------------- */
+
+/* TRI_V / TRI_G (mrdp_setup.h): the attributes' value, DaDx and DaDe, from
+ * the vertex values as the RTL computes them (mrdp_vattr) or as sent, then
+ * the N64 triangle they make. (DaDy is not used by the walker.) */
+#ifndef MRDP_N64
+static void draw_triangle_vg(mrdp_t *r, const uint32_t *w, int g)
+{
+    unsigned flags = (w[0] >> 24) & 7u;
+    int32_t F[4] = { (int32_t)w[8], (int32_t)w[9], (int32_t)w[10], (int32_t)w[11] };
+    int32_t kx = (int32_t)w[12], ky = (int32_t)w[13], dxh = (int32_t)w[5];
+    int32_t val[8], ddx[8], dde[8], ddy[8];
+    const uint32_t *a = w + (g ? 8 : 14);
+    for (int i = 0; i < 8; i++) {
+        val[i] = ddx[i] = dde[i] = ddy[i] = 0;
+        if (!mrdp_attr_on(flags, i)) continue;
+        if (g) { val[i] = (int32_t)a[0]; ddx[i] = (int32_t)a[1]; dde[i] = (int32_t)a[2]; }
+        else mrdp_vattr(F, kx, ky, dxh, (int32_t)a[0], (int32_t)a[1], (int32_t)a[2], &val[i], &ddx[i], &dde[i], &ddy[i]);
+        a += 3;
+    }
+    uint32_t t[44];
+    t[0] = ((0x08u | flags) << 24) | (w[0] & 0x00FFFFFFu);
+    for (int k = 1; k < 8; k++) t[k] = w[k];
+    mrdp_put_attrs(t, 8, flags, val, ddx, dde, ddy);
+    draw_triangle(r, t);
+}
+#endif
+
+/* TRI_R (mrdp_setup.h): MRDP's whole setup, mrdp_tri_r() + mrdp_tri_r_attr() */
+#ifndef MRDP_N64
+static void draw_triangle_r(mrdp_t *r, const uint32_t *w)
+{
+    unsigned flags = (w[0] >> 19) & 7u, tile = (w[0] >> 16) & 7u;
+    int32_t xy[6], kx, ky;
+    for (int k = 0; k < 6; k++) xy[k] = (int32_t)w[1 + k];
+    mrdp_edges_t E;
+    mrdp_fac_t fc;
+    if (!mrdp_tri_r(xy, &E, &fc, &kx, &ky)) return;
+    r->grow = mrdp_grow_mask(&E);
+    int32_t av[8][3] = { { 0 } };
+    const uint32_t *a = w + 7;
+    for (int i = 0; i < 8; i++) {
+        if (!mrdp_attr_on(flags, i)) continue;
+        av[i][0] = (int32_t)a[0]; av[i][1] = (int32_t)a[1]; av[i][2] = (int32_t)a[2];
+        a += 3;
+    }
+    mrdp_tri_r_fields(av, flags);
+    int32_t val[8], ddx[8], dde[8], ddy[8];
+    for (int i = 0; i < 8; i++) {
+        val[i] = ddx[i] = dde[i] = ddy[i] = 0;
+        if (!mrdp_attr_on(flags, i)) continue;
+        mrdp_tri_r_attr(&fc, kx, ky, E.dxh, av[i][0], av[i][1], av[i][2], &val[i], &ddx[i], &dde[i], &ddy[i]);
+    }
+    uint32_t t[44];
+    mrdp_put_edges(t, &E, (0x08u | flags) << 24, tile);
+    mrdp_put_attrs(t, 8, flags, val, ddx, dde, ddy);
+    draw_triangle(r, t);
+}
+#endif
+
+static void execute(mrdp_t *r, const uint32_t *w)
+{
+    unsigned op = (w[0] >> 24) & 0x3F;
+    r->grow = 0;                                  /* TRI_R sets it (draw_triangle_r) */
+#ifdef MRDP_N64
+    /* drawn to a 16-bit colour image only (an 8- or 32-bit one: nothing) */
+    if (r->cimg_size != 2 && ((op >= 0x08 && op <= 0x0F) || op == MRDP_OP_TEXRECT || op == MRDP_OP_TEXRECT_FLIP
+                              || op == MRDP_OP_FILL_RECT)) return;
+#endif
+    if (op >= 0x08 && op <= 0x0F) { draw_triangle(r, w); return; }
+#ifndef MRDP_N64
+    if (op >= MRDP_OP_TRI_V && op <= (MRDP_OP_TRI_V | 7u)) { draw_triangle_vg(r, w, 0); return; }
+    if (op >= MRDP_OP_TRI_G && op <= (MRDP_OP_TRI_G | 7u)) { draw_triangle_vg(r, w, 1); return; }
+    if (op == MRDP_OP_TRI_R) { draw_triangle_r(r, w); return; }
+#endif
+    switch (op) {
+    case MRDP_OP_NOP: case MRDP_OP_SYNC_LOAD: case MRDP_OP_SYNC_PIPE: case MRDP_OP_SYNC_TILE:
+        break;
+    case MRDP_OP_SYNC_FULL: r->sync_count++; break;
+    case MRDP_OP_TEXRECT: draw_texrect(r, w, 0); break;
+    case MRDP_OP_TEXRECT_FLIP: draw_texrect(r, w, 1); break;
+    case MRDP_OP_SET_SCISSOR:
+        r->sc_xh = (w[0] >> 12) & 0xFFF; r->sc_yh = w[0] & 0xFFF;
+        r->sc_xl = (w[1] >> 12) & 0xFFF; r->sc_yl = w[1] & 0xFFF;
+        break;
+#ifdef MRDP_N64
+    case MRDP_OP_SET_PRIM_Z: r->prim_z = (uint16_t)((w[1] >> 16) << 1); r->prim_dz = (uint16_t)w[1]; break;   /* the N64's: 15 bits, and its delta */
+#else
+    case MRDP_OP_SET_PRIM_Z: r->prim_z = (uint16_t)(w[1] >> 16); break;
+#endif
+    case MRDP_OP_SET_OTHER: r->other_h = w[0] & 0xFFFFFF; r->other_l = w[1]; break;
+    case MRDP_OP_SET_TILESIZE: set_tile_size(r, w); break;
+#ifdef MRDP_N64
+    case MRDP_OP_LOAD_TILE: set_tile_size(r, w); load_tile_n64(r, w); r->load_count++; break;
+    case MRDP_OP_LOAD_BLOCK: load_block(r, w); r->load_count++; break;
+    case MRDP_OP_LOAD_TLUT: load_tlut(r, w); r->load_count++; break;
+#else
+    case MRDP_OP_LOAD_TILE: load_tile(r, w); r->load_count++; break;
+#endif
+    case MRDP_OP_SET_TILE: set_tile(r, w); break;
+    case MRDP_OP_FILL_RECT: fill_rect(r, w); break;
+    case MRDP_OP_SET_FILL: r->fill = w[1]; break;
+    case MRDP_OP_SET_FOG: r->fog = rgba_of(w[1]); break;
+    case MRDP_OP_SET_BLEND: r->blend = rgba_of(w[1]); break;
+    case MRDP_OP_SET_PRIM: r->prim = rgba_of(w[1]); r->prim_lod_frac = (uint8_t)w[0]; break;
+    case MRDP_OP_SET_ENV: r->env = rgba_of(w[1]); break;
+    case MRDP_OP_SET_COMBINE: r->combine_hi = w[0] & 0xFFFFFF; r->combine_lo = w[1]; break;
+    case MRDP_OP_SET_TIMG: r->timg = w[1]; r->timg_width = (w[0] & 0x3FF) + 1; r->timg_size = (w[0] >> 19) & 3; break;
+    case MRDP_OP_SET_ZIMG: r->zimg = w[1]; break;
+    case MRDP_OP_SET_CIMG: r->cimg = w[1]; r->cimg_width = (w[0] & 0x3FF) + 1; r->cimg_size = (w[0] >> 19) & 3; break;
+    default: r->unknown_ops++; break;
+    }
+}
+
+void mrdp_push(mrdp_t *r, uint32_t word)
+{
+    if (r->ncmd == 0)
+        r->need = 2 * mrdp_cmd_len(word);
+    r->cmd[r->ncmd++] = word;
+    if (r->ncmd == r->need) {
+        execute(r, r->cmd);
+        r->ncmd = 0;
+    }
+}
