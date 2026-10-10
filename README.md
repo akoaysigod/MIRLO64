@@ -132,7 +132,7 @@ python3 tools/mips_inits.py                        # both images, for the bitstr
 cd projects
 quartus_sh --flow compile mirlo
 python3 ../tools/package_bitstream.py output_files/mirlo.rbf mirlo.rev   # bit-reversed, as the Pocket wants it
-python3 ../tools/make_release.py mirlo.rev tortuga.Mirlo_0.9.0.zip                        # the SD-card zip
+python3 ../tools/make_release.py mirlo.rev tortuga.Mirlo_0.1.zip                          # the SD-card zip
 ```
 
 The boot ROM and the geometry core's firmware are part of the bitstream: after changing either, or the register map, repeat the sequence (see [docs/geometry_core.md](docs/geometry_core.md)).

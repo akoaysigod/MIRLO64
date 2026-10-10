@@ -1,0 +1,2 @@
+Put your N64 games here (.z64 files, big-endian).
+Mirlo asks for one when you launch the core.
