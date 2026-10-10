@@ -48,7 +48,7 @@ The register reference is [docs/control.md](docs/control.md); the map itself is 
 2. Unzip it onto the **root** of the Pocket's SD card, merging with the folders already there. It adds only Mirlo's own files:
 
    ```
-   Assets/mirlo/common/          where Mirlo's games go (empty)
+   Assets/mirlo/common/          n64rt.sys (the runtime) and n64savedb.txt; where Mirlo's games go
    Cores/tortuga.Mirlo/          the core: mirlo.rev (the bitstream), core.json, ...
    Platforms/mirlo.json          the platform, under Computer
    Platforms/_images/mirlo.bin   its image
@@ -128,12 +128,18 @@ python3 tools/mirlo_regs.py                        # the register map: rtl/soc/m
 (cd lang/mips/boot && make)                        # the game CPU's boot ROM
 (cd lang/c/geom && make)                           # the geometry core's firmware
 python3 tools/mips_inits.py                        # both images, for the bitstream
+python3 sim/rsp/make_div_rom.py rtl/rsp/rsp_div_rom.hex   # the RSP's reciprocal ROM (not in git)
 
 cd projects
 quartus_sh --flow compile mirlo
 python3 ../tools/package_bitstream.py output_files/mirlo.rbf mirlo.rev   # bit-reversed, as the Pocket wants it
-python3 ../tools/make_release.py mirlo.rev tortuga.Mirlo_0.1.zip                          # the SD-card zip
+
+(cd ../lang/n64rt && make)                         # the runtime: build/n64rt.bin, released as n64rt.sys
+cp ../lang/n64rt/build/n64rt.bin n64rt.sys
+python3 ../tools/make_release.py mirlo.rev n64rt.sys tortuga.Mirlo_0.1.zip   # the SD-card zip
 ```
+
+`n64rt.sys` is the program the core runs as its data slot 3 (`Assets/mirlo/common/n64rt.sys`): it loads the game (a `.z64`) from slot 0 and runs it with the game's own libultra. It needs the libraries, the register map and the geometry core's firmware of the first lines above, and no bitstream: `lang/n64rt/Makefile` builds it (about 60 KB) from `lang/n64rt/loader/main.c` and the runtime in `lang/n64rt`.
 
 The boot ROM and the geometry core's firmware are part of the bitstream: after changing either, or the register map, repeat the sequence (see [docs/geometry_core.md](docs/geometry_core.md)).
 

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Pack the SD-card release zip: the core as it sits on the Pocket's SD card.
 
-    tools/make_release.py <mirlo.rev> <out.zip>
+    tools/make_release.py <mirlo.rev> <n64rt.sys> <out.zip>
 
-<mirlo.rev> is the bit-reversed bitstream (tools/package_bitstream.py). The
+<mirlo.rev> is the bit-reversed bitstream (tools/package_bitstream.py) and
+<n64rt.sys> the runtime (lang/n64rt: `make -C lang/n64rt`, then
+build/n64rt.bin, which the core wants under that name as data slot 3). The
 zip holds, from the SD card's root:
 
     Cores/tortuga.Mirlo/     the core definition (pkg/pocket), mirlo.rev,
                              LICENSE.txt, NOTICE.txt
     Platforms/mirlo.json     the platform (category Computer) and its image
     Platforms/_images/mirlo.bin
-    Assets/mirlo/common/     empty: where games go
+    Assets/mirlo/common/     n64rt.sys, n64savedb.txt (pkg/pocket) and
+                             PUT_ROMS_HERE.txt: where the games go
 
 so a user unzips it onto the card's root and is done. Entries are written in
 a fixed order with a fixed date, so the same inputs give the same zip.
@@ -39,9 +42,9 @@ def add_dir(z, name):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         sys.exit(__doc__)
-    rev, out = sys.argv[1], sys.argv[2]
+    rev, sys_file, out = sys.argv[1:]
     files = []
     for d, _, names in os.walk(PKG):
         for n in names:
@@ -51,6 +54,7 @@ def main():
                 continue                       # the bitstream comes from the argument
             files.append((rel, p))
     files.append((CORE + "/mirlo.rev", rev))
+    files.append(("Assets/mirlo/common/n64rt.sys", sys_file))
     files.append((CORE + "/LICENSE.txt", os.path.join(ROOT, "LICENSE")))
     files.append((CORE + "/NOTICE.txt", os.path.join(ROOT, "NOTICE")))
     files.sort()
