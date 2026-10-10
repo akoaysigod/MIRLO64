@@ -91,6 +91,19 @@ void game_main(void)
     unmap_all();
     MTC0(10, 0x28000005u); TLBP(); check(28, MFC0(0), NOTFOUND);
     MTC0(0, 17); TLBR(); check(29, MFC0(10), 0x80000000u + 17u * 0x2000u); check(30, MFC0(5), 0);
+    /* a TLB instruction in code on a mapped page (GoldenEye's libultra runs from 0x7000_0000): the runtime's fast path must not
+     * read the instruction as it does KSEG0's (a load of it that missed the tables took the monitor's own exception for ever) */
+    K1(0x00180000u)[0] = 0x42000008u;                       /* tlbp */
+    K1(0x00180000u)[1] = 0x03E00008u;                       /* jr ra */
+    K1(0x00180000u)[2] = 0;
+    write_entry(9, 0, 0x70000000u, LO(0x00180000u, 1), LO(0x00181000u, 1));
+    MTC0(10, 0x70000000u); MTC0(0, 0);
+    ((void (*)(void))0x70000000u)();
+    check(31, MFC0(0), 9);
+    MTC0(10, 0x70000000u); MTC0(0, 0);
+    ((void (*)(void))0x70000000u)();
+    check(32, MFC0(0), 9);
+    unmap_all();
     REPORT[1] = s_sum;
     REPORT[0] = s_fails ? 0xBADBAD00u + s_fails : 0x600D600Du;
 

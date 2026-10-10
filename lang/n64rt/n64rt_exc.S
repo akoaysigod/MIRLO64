@@ -326,8 +326,9 @@ n64rt_mon_tlbq:
     srl     $k0, $k1, 28
     xori    $k0, $k0, 8             # KSEG0
     bnez    $k0, n64rt_mon_slow
-    lw      $k1, 0($k1)             # the instruction
-    lui     $k0, 0x4200
+    lui     $k0, 0x4200             # (this delay slot must not be the load: for code on a mapped page, GoldenEye's libultra at
+    lw      $k1, 0($k1)             #  0x7000_0000, it runs before the branch's decision and faults on the tables, with ErrorEPC the
+                                    #  same: the entry came back for ever)
     xor     $k0, $k0, $k1
     srl     $k0, $k0, 6             # CO set and the rest 0, but the function
     bnez    $k0, n64rt_mon_slow
