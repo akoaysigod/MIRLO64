@@ -11,7 +11,7 @@
 // the scan-out's base).
 //
 // The Pocket's side of the data slots (the addresses are data.json's, read
-// from pkg/pocket/Cores/tortuga.Mirlo -- DATA_JSON=<file>: another):
+// from pkg/pocket/Cores/tortuga.Mirlo64 -- DATA_JSON=<file>: another):
 //   prog.bin         slot 0, at the bridge's address 0: the program, or a
 //                    game file with the program and a ROM in it
 //   ROM=<file.z64>   the two files of an N64 game: the ROM is slot 0, as it
@@ -438,7 +438,7 @@ int main(int argc, char **argv)
     bool noload = getenv("NOLOAD") != nullptr;
     {   // data.json, beside the sources: sim/mips_soc/../../pkg
         std::string here(__FILE__), dj = getenv("DATA_JSON") ? getenv("DATA_JSON") :
-            here.substr(0, here.rfind('/') + 1) + "../../pkg/pocket/Cores/tortuga.Mirlo/data.json";
+            here.substr(0, here.rfind('/') + 1) + "../../pkg/pocket/Cores/tortuga.Mirlo64/data.json";
         if (!read_data_json(dj)) { fprintf(stderr, "%s: no slot 0 in it\n", dj.c_str()); return 2; }
     }
     // the slots' files: the program (ROM=: and the ROM, which is then slot 0

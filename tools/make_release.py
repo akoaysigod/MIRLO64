@@ -8,9 +8,9 @@
 build/n64rt.bin, which the core wants under that name as data slot 3). The
 zip holds, from the SD card's root:
 
-    Cores/tortuga.Mirlo/     the core definition (pkg/pocket), mirlo.rev,
+    Cores/tortuga.Mirlo64/   the core definition (pkg/pocket), mirlo.rev,
                              LICENSE.txt, NOTICE.txt
-    Platforms/mirlo.json     the platform (category Computer) and its image
+    Platforms/mirlo.json     the platform (category Console) and its image
     Platforms/_images/mirlo.bin
     Assets/mirlo/common/     n64rt.sys, n64savedb.txt (pkg/pocket) and
                              PUT_ROMS_HERE.txt: where the games go
@@ -24,7 +24,7 @@ import zipfile
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 PKG = os.path.join(ROOT, "pkg", "pocket")
-CORE = "Cores/tortuga.Mirlo"
+CORE = "Cores/tortuga.Mirlo64"
 DATE = (2026, 1, 1, 0, 0, 0)
 
 

@@ -49,7 +49,7 @@ The register reference is [docs/control.md](docs/control.md); the map itself is 
 
    ```
    Assets/mirlo/common/          n64rt.sys (the runtime) and n64savedb.txt; where Mirlo's games go
-   Cores/tortuga.Mirlo/          the core: mirlo.rev (the bitstream), core.json, ...
+   Cores/tortuga.Mirlo64/        the core: mirlo.rev (the bitstream), core.json, ...
    Platforms/mirlo.json          the platform, under Console
    Platforms/_images/mirlo.bin   its image
    ```
@@ -57,7 +57,7 @@ The register reference is [docs/control.md](docs/control.md); the map itself is 
 3. Put the games (`.bin` files) in `Assets/mirlo/common/`. Mirlo needs one to start: the release carries none; build one with the SDK (see [Writing software](#writing-software)) or get a Mirlo game such as [Super Mirlo 64](https://github.com/tortugaveloz/supermirlo64).
 4. On the Pocket: **openFPGA → Console → Mirlo**, then pick a game.
 
-Saves (`.sav`) appear in `Saves/mirlo/common/` when you quit a game. To update the core, unzip a newer release the same way; it replaces the files in `Cores/tortuga.Mirlo/`.
+Saves (`.sav`) appear in `Saves/mirlo/common/` when you quit a game. To update the core, unzip a newer release the same way; it replaces the files in `Cores/tortuga.Mirlo64/`.
 
 ## Using the core
 

@@ -987,7 +987,7 @@ address and data still around them, nothing but reads at an empty slot.
 
 ### The core's settings for the controller
 
-`interact.json` (`pkg/pocket/Cores/tortuga.Mirlo/`) lists them in this order (the order of the entries is the menu's). The
+`interact.json` (`pkg/pocket/Cores/tortuga.Mirlo64/`) lists them in this order (the order of the entries is the menu's). The
 Pocket writes each one to a field of the two `APF_INTERACT` words (`docs/control.md`, Interact API), and the runtime reads the
 words at every poll of the controller (`lang/n64rt/n64rt_pad.h`, `n64rt_pad_map()`, a pure function that `lang/n64rt/test/pad_test.py`
 checks on the host against the table below over every combination of settings). The Pocket's own Controls menu still remaps what

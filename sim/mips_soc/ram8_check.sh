@@ -9,7 +9,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"; R="$(cd "$HERE/../.." && pwd)"
 OBJ="${1:?usage: ram8_check.sh OBJ_DIR [Mcycles]}"; C="${2:-60}"; O="${OUT:-/tmp/ram8_check}"
 mkdir -p "$O"
 # (the test is a program linked for 0x4000_0000: slot 0 at 0, not at the ROM's 1 MiB)
-python3 - "$R/pkg/pocket/Cores/tortuga.Mirlo/data.json" "$O/data0.json" <<'EOF'
+python3 - "$R/pkg/pocket/Cores/tortuga.Mirlo64/data.json" "$O/data0.json" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 d['data']['data_slots'][0]['address'] = '0x00000000'

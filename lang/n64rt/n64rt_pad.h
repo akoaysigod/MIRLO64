@@ -4,7 +4,7 @@
  * The keys are APF_INPUT's (docs/control.md: Controller/Joystick Bitmap; the Pocket's own Controls menu remaps what the
  * buttons give, the runtime only sees these bits), the stick bytes are its four joystick bytes (left X, left Y, right X,
  * right Y, from the low byte up; 0x80 centred) and the settings are the two words of APF_INTERACT, as interact.json
- * (pkg/pocket/Cores/tortuga.Mirlo/interact.json) writes them -- a field at a time, at the addresses 0x1000_0100 + 4 x n:
+ * (pkg/pocket/Cores/tortuga.Mirlo64/interact.json) writes them -- a field at a time, at the addresses 0x1000_0100 + 4 x n:
  *
  *   word 0 [4:0]    n=2  "Controller 1 pak": n64rt_pak.c
  *          [9:5]    n=3  "Crop Vertical" (the video: rtl/soc/mirlo_regs.sv)
