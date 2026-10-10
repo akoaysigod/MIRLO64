@@ -52,7 +52,7 @@ module  mf_pllbase_0002(
 		.output_clock_frequency4("12.500000 MHz"),
 		.phase_shift4("20000 ps"),
 		.duty_cycle4(50),
-		.output_clock_frequency5(`MIRLO_CPU_CLK == 32 ? "93.750000 MHz" : `MIRLO_CPU_CLK == 43 ? "83.333333 MHz" : "78.125000 MHz"),
+		.output_clock_frequency5("93.750000 MHz"),
 		.phase_shift5("0 ps"),
 		.duty_cycle5(50),
 		.output_clock_frequency6("0 MHz"),
