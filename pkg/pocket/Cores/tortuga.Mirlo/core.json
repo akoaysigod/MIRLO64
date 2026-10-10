@@ -6,7 +6,7 @@
         "mirlo"
       ],
       "shortname": "Mirlo",
-      "description": "Mirlo: a MIPS computer for the Analogue Pocket with MRDP, an N64-style rasterizer (experimental)",
+      "description": "MIRLO64: Nintendo 64 games on the Analogue Pocket, on an original SoC with its own MIPS CPU, RSP and RDP",
       "author": "tortuga",
       "url": "https://github.com/tortugaveloz/MIRLO64",
       "version": "0.1",
