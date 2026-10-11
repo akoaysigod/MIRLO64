@@ -213,10 +213,15 @@ It implements:
 * VRCP, VRCPL, VRCPH, VRSQ, VRSQL, VRSQH, VMOV, VNOP, VNULL;
 * MFC2, MTC2, CFC2, CTC2;
 * the loads LBV, LSV, LLV, LDV, LQV, LRV, LPV, LUV, LTV and the stores SBV,
-  SSV, SLV, SDV, SQV, SRV, SPV, SUV, STV, at any address and element.
+  SSV, SLV, SDV, SQV, SRV, SPV, SUV, STV, at any address and element;
+* SHV and SFV (bits 14..7 of each lane, a byte every second / fourth of the
+  16 from the address's 8-byte block): the JPEG microcodes pack their YUV
+  with them (Ogre Battle 64's backgrounds). SFV at elements 0, 4, 8 and 12
+  (lanes 0-3, 1,2,3,0, 4-7, 5,6,7,4).
 
-Not implemented: LHV, LFV, LWV, SHV, SFV, SWV, VRNDP, VRNDN, VMULQ, VMACQ and
-the reserved COP2 functions. They change nothing and set `unimpl`.
+Not implemented: LHV, LFV, LWV, SWV, SFV at another element, VRNDP, VRNDN,
+VMULQ, VMACQ and the reserved COP2 functions. They change nothing and set
+`unimpl`.
 
 ### Four lanes
 
@@ -391,7 +396,7 @@ Everything specific to the RSP is in `sim/rsp`.
 | `make_div_rom.py` | the reciprocal ROM |
 
 The model is the contract: the RTL must have the same state after each
-instruction. The model covers slightly more than the RTL (it has LHV, SHV and
+instruction. The model covers slightly more than the RTL (it has LHV and
 SWV, and gives the reserved functions a result).
 
 ### Lockstep bench

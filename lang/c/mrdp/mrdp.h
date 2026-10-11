@@ -46,6 +46,7 @@ enum {
     MRDP_OP_SYNC_PIPE    = 0x27,
     MRDP_OP_SYNC_TILE    = 0x28,
     MRDP_OP_SYNC_FULL    = 0x29,
+    MRDP_OP_SET_CONVERT  = 0x2C,   /* MRDP_N64: K0..K5 (YUV textures) */
     MRDP_OP_SET_SCISSOR  = 0x2D,
     MRDP_OP_SET_PRIM_Z   = 0x2E,
     MRDP_OP_SET_OTHER    = 0x2F,
@@ -75,6 +76,12 @@ int mrdp_cmd_len(uint32_t w0);   /* 64-bit words, from a command's first word */
 #define MRDP_H_FILT_SHIFT    12        /* 0 point, 2 bilinear (3-point), 3 average */
 #define MRDP_H_TLUT_EN       (1u << 15)
 #define MRDP_H_TLUT_IA       (1u << 14) /* the TLUT's entries are IA16 (else RGBA5551) */
+/* MRDP_N64: the texture filter's convert (G_MDSFT_TEXTCONV): BI_LERP_0 / BI_LERP_1 off -- the first / second
+ * cycle's texel is converted from YUV (G_TC_CONV: both; G_TC_FILTCONV: the second, of the first's filtered
+ * texel, CONVERT_ONE; G_TC_FILT: neither) */
+#define MRDP_H_BILERP0       (1u << 11)
+#define MRDP_H_BILERP1       (1u << 10)
+#define MRDP_H_CONVERT_ONE   (1u << 9)
 #define MRDP_L_ALPHA_CMP     (1u << 0) /* threshold: blend color alpha */
 #define MRDP_L_ALPHA_DITHER  (1u << 1) /* the alpha compare's threshold is noise */
 #define MRDP_L_Z_SRC_PRIM    (1u << 2)
@@ -164,7 +171,8 @@ int mrdp_cmd_len(uint32_t w0);   /* 64-bit words, from a command's first word */
 typedef struct {
     uint8_t fmt;          /* 0 RGBA5551 (N64 layout: R[15:11] G B A[0]),
                              1 IA88 (I[15:8] A[7:0]), 2 RGBA4444 (R[15:12]..A[3:0]);
-                             MRDP_N64: the N64's format (0 RGBA 1 YUV 2 CI 3 IA 4 I) */
+                             MRDP_N64: the N64's format (0 RGBA 1 YUV 2 CI 3 IA 4 I;
+                             YUV 16-bit only) */
     uint8_t size;         /* MRDP_N64: 0 4-bit 1 8-bit 2 16-bit 3 32-bit */
     uint8_t palette;      /* MRDP_N64: CI4's palette */
     uint16_t line;        /* texels per TMEM row / 4 (N64: 64-bit words) */
@@ -193,6 +201,7 @@ typedef struct {
     uint32_t fill;
     mrdp_rgba_t fog, blend, prim, env;
     uint8_t prim_lod_frac;
+    int16_t k[6];                          /* MRDP_N64: SET_CONVERT's K0..K5 (9 bits signed; K4, K5 as the combiner reads them: 0..511) */
     uint16_t prim_z;
     uint16_t prim_dz;                      /* MRDP_CVG: SET_PRIM_DEPTH's delta (the blender's shift without Z_CMP) */
     uint16_t sc_xh, sc_yh, sc_xl, sc_yl;   /* u10.2 */

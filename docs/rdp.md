@@ -94,6 +94,7 @@ change with pixels in flight.
 | 0x24, 0x25 | texture rectangle, flipped | |
 | 0x26-0x28 | sync load, pipe, tile | nothing to do: commands run in order |
 | 0x29 | sync full | completes when every earlier write has been accepted by the memory |
+| 0x2C | set convert | K0..K5: the YUV conversion (below) |
 | 0x2D | set scissor | the four coordinates; the interlace field bits are not read |
 | 0x2E | set primitive depth | Z (15 bits) and its delta |
 | 0x2F | set other modes | what is read of them: below |
@@ -107,7 +108,7 @@ change with pixels in flight.
 | 0x3C | set combine | both cycles |
 | 0x3D-0x3F | texture, depth, colour image | |
 
-Any other opcode (set key, set convert, the undefined ones) is counted in
+Any other opcode (set key, the undefined ones) is counted in
 `unknown_ops` and skipped as a two-word command.
 
 ## Drawing a primitive
@@ -228,7 +229,23 @@ An I texel gives its value on all four channels. With the TLUT enabled a 4-
 or 8-bit texel of any format is an index instead (a 4-bit one with the
 tile's palette above it), and the entry is RGBA5551 or IA 8 + 8 by the other
 modes' TLUT type; 16- and 32-bit texels are never looked up. YUV is not
-converted.
+converted by the texel decode; see below.
+
+**YUV** (16-bit; Ogre Battle 64's backgrounds, which its JPEG microcode
+decodes into YUV on the RSP). The loads split a pixel pair's U Y0 V Y1 as a
+32-bit RGBA texel is split: U V to the lower half of TMEM, Y0 Y1 to the same
+word of the upper (`rdp_mem.v` load mode 3). A texel is (U, V, Y, Y). The
+texture filter converts it when its pass's BI_LERP bit is off (G_TC_CONV:
+the first cycle; G_TC_FILTCONV: a 2-cycle pixel's second, of the first's
+filtered texel), from the texel at (s0, t0): R = Y + K0 V, G = Y + K1 U +
+K2 V, B = Y + K3 U, U and V less 128, each K as the N64's 2K + 1 in
+1/256ths, A = Y (`rdp_pix.v` `yuv_conv`, beside the filter). Then the
+combiner's `(TEXEL0 - K4) * K5 + TEXEL0` (G_CC_YUV2RGB) scales the
+luminance. Differences from the console: only a YUV tile's texel is
+converted (the bits are 0 in a mode a game never set); the converted
+channels are clamped to a byte (the hardware keeps 9 bits: the same pixels
+saturate after the combiner); an unconverted YUV texel reaches the combiner
+with U and V as their bytes, not less 128. `test_cvg.c` section 12.
 
 ### Filter
 
@@ -288,8 +305,8 @@ Colour and alpha are `((A - B) * C + D * 256 + 0x80) >> 8`, kept to 9 bits.
   coverage is multiplied by it (CVG_X_ALPHA): a fully covered opaque texel
   keeps all 8 samples.
 * SHADE is saturated to a byte, 0..255, when it enters the pipeline.
-* The primitive LOD fraction is an input. NOISE, the LOD fraction, the key
-  and the convert inputs read 0.
+* The primitive LOD fraction is an input. NOISE, the LOD fraction and the key
+  inputs read 0; K4 (B, 7) and K5 (C, 15) are SET_CONVERT's.
 
 ### Alpha and coverage
 
@@ -436,12 +453,13 @@ A picture 512 wide or more is shown with the filters off.
   reads 0.
 * **TEXEL1** is the next tile at the same coordinates. In the second cycle
   of a 2-cycle pixel it is the tile's own sample, not the next pixel's.
-* **YUV** textures are not converted; SET_CONVERT and SET_KEY are skipped.
-  The key, convert and noise inputs of the combiner read 0.
+* **YUV** textures are converted as described above, with the differences
+  listed there; SET_KEY is skipped. The key and noise inputs of the combiner
+  read 0.
 * **Shade** is not corrected to the covered sample; only Z is.
 * **Scissor**: the interlace field bits are not read.
-* **Other modes**: detail, sharpen, LOD enable, the bilerp and convert bits
-  and the key enable are not read.
+* **Other modes**: detail, sharpen, LOD enable and the key enable are not
+  read; the bilerp and convert bits are read only for YUV texels.
 
 ## How it is verified
 
